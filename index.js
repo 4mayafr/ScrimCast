@@ -42,6 +42,9 @@ const {
   ChannelType,
   ActivityType,
   Events,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require('discord.js');
 
 // Short, readable version of an error (network errors can be huge AggregateErrors)
@@ -69,7 +72,7 @@ const TOKEN = clean(process.env.DISCORD_TOKEN).replace(/^Bot\s+/i, '');
 const CLIENT_ID = clean(process.env.CLIENT_ID);
 const GUILD_ID = optionalId('GUILD_ID'); // optional: makes slash commands update instantly in one server
 const BOT_OWNER_ID = optionalId('BOT_OWNER_ID'); // optional: who may use /admin (default: the bot application's owner)
-const STATUS_TEXT = clean(process.env.STATUS_TEXT).slice(0, 128) || 'Scrim Board | /scrim post'; // "Playing ..."
+const STATUS_TEXT = clean(process.env.STATUS_TEXT).slice(0, 128) || 'Scrim Board'; // "Playing ..."
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 
 for (const old of ['CASTER_ROLE_ID', 'SCRIM_CHANNEL_ID']) {
@@ -103,7 +106,7 @@ function buildEmbed(s) {
   const cocasters = s.cocasters || [];
   const open = s.casters.length < MAX_CASTERS && !s.cancelled;
   const embed = new EmbedBuilder()
-    .setTitle(`${s.game}: ${s.team1} vs ${s.team2}`)
+    .setTitle(`${s.team1} vs ${s.team2}`)
     .setColor(s.cancelled ? 0x808080 : open ? 0x57f287 : 0xed4245)
     .addFields(
       { name: 'When', value: s.time, inline: true },
@@ -150,11 +153,18 @@ const commands = [
     .addSubcommand((c) =>
       c
         .setName('set')
-        .setDescription('Set where scrims are posted, where private threads are made, and who can claim')
+        .setDescription('Set the panel channel, where scrims are posted, where threads are made, and who can claim')
+        .addChannelOption((o) =>
+          o
+            .setName('panel_channel')
+            .setDescription('Channel that gets the "Post Scrim" button panel')
+            .addChannelTypes(ChannelType.GuildText)
+            .setRequired(true)
+        )
         .addChannelOption((o) =>
           o
             .setName('post_channel')
-            .setDescription('Channel where scrims are posted')
+            .setDescription('Channel where scrims are posted for casters to claim')
             .addChannelTypes(ChannelType.GuildText)
             .setRequired(true)
         )
@@ -170,6 +180,7 @@ const commands = [
         )
     )
     .addSubcommand((c) => c.setName('view').setDescription('Show the current setup'))
+    .addSubcommand((c) => c.setName('panel').setDescription('Post the "Post Scrim" panel again (for example if it was deleted)'))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -184,18 +195,6 @@ const commands = [
   new SlashCommandBuilder()
     .setName('scrim')
     .setDescription('Scrim board')
-    .addSubcommand((c) =>
-      c
-        .setName('post')
-        .setDescription('Post a scrim for a caster to claim')
-        .addStringOption((o) => o.setName('game').setDescription('Game (e.g. Valorant)').setRequired(true))
-        .addStringOption((o) => o.setName('team1').setDescription('Team 1').setRequired(true))
-        .addStringOption((o) => o.setName('team2').setDescription('Team 2').setRequired(true))
-        .addStringOption((o) =>
-          o.setName('time').setDescription('When, e.g. "Sat 25 Oct 7pm AEDT" or <t:1761379200:F>').setRequired(true)
-        )
-        .addStringOption((o) => o.setName('notes').setDescription('Extra info (maps, format, lobby details)'))
-    )
     .addSubcommand((c) =>
       c
         .setName('cancel')
@@ -359,6 +358,153 @@ async function refreshMessage(interaction, s) {
   await interaction.update({ embeds: [buildEmbed(s)], components: [buildButtons(s)] });
 }
 
+// ---------- the "Post Scrim" panel and its form ----------
+function buildPanelEmbed() {
+  return new EmbedBuilder()
+    .setTitle('Post a scrim')
+    .setColor(0x5865f2)
+    .setDescription(
+      'Need a caster for your scrim? Press **Post Scrim** and fill in the form.\n\n' +
+        'Your scrim is posted for casters to claim, and you get a private thread to talk with the caster and co-casters.'
+    );
+}
+
+function buildPanelButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('postscrim').setLabel('Post Scrim').setStyle(ButtonStyle.Primary)
+  );
+}
+
+function textRow(id, label, style, { required = true, max, placeholder }) {
+  return new ActionRowBuilder().addComponents(
+    new TextInputBuilder()
+      .setCustomId(id)
+      .setLabel(label)
+      .setStyle(style)
+      .setRequired(required)
+      .setMaxLength(max)
+      .setPlaceholder(placeholder)
+  );
+}
+
+function buildScrimModal() {
+  return new ModalBuilder()
+    .setCustomId('scrimform')
+    .setTitle('Post a scrim')
+    .addComponents(
+      textRow('team1', 'Team 1', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Red Dragons' }),
+      textRow('team2', 'Team 2', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Blue Wolves' }),
+      textRow('time', 'When', TextInputStyle.Short, { max: 100, placeholder: 'e.g. Sat 25 Oct, 7pm AEDT' }),
+      textRow('notes', 'Notes (optional)', TextInputStyle.Paragraph, {
+        required: false,
+        max: 500,
+        placeholder: 'Maps, format, lobby details...',
+      })
+    );
+}
+
+// Posts the panel in the configured panel channel, replacing the previous one. Returns { ok, reason }.
+async function postPanel(guildId) {
+  const cfg = getConfig(guildId);
+  if (!cfg || !cfg.panelChannelId) return { ok: false, reason: 'no panel channel is set' };
+  const ch = await client.channels.fetch(cfg.panelChannelId).catch(() => null);
+  if (!ch) return { ok: false, reason: "I can't find that channel" };
+
+  if (cfg.panelMessage) {
+    const oldCh = await client.channels.fetch(cfg.panelMessage.channelId).catch(() => null);
+    const old = oldCh && (await oldCh.messages.fetch(cfg.panelMessage.messageId).catch(() => null));
+    if (old) await old.delete().catch(() => {});
+  }
+  try {
+    const msg = await ch.send({ embeds: [buildPanelEmbed()], components: [buildPanelButtons()] });
+    cfg.panelMessage = { channelId: msg.channelId, messageId: msg.id };
+    save();
+    return { ok: true };
+  } catch (e) {
+    console.error('Posting the panel failed:', e.message);
+    return { ok: false, reason: 'I need View Channel, Send Messages and Embed Links there' };
+  }
+}
+
+// Creates the scrim from the submitted form. `interaction` must already be deferred.
+async function createScrim(interaction, { team1, team2, time, notes }) {
+  const cfg = getConfig(interaction.guildId);
+  if (!configComplete(cfg)) {
+    return interaction.editReply({ content: 'This server is not set up yet. The server owner needs to run `/setup set` first.' });
+  }
+  const postChannel = await client.channels.fetch(cfg.postChannelId).catch(() => null);
+  const threadChannel = await client.channels.fetch(cfg.threadChannelId).catch(() => null);
+  if (!postChannel || !threadChannel) {
+    return interaction.editReply({ content: "I can't find the configured channels. The server owner should run `/setup set` again." });
+  }
+
+  const s = {
+    id: db.nextId,
+    guildId: interaction.guildId,
+    team1,
+    team2,
+    time,
+    notes,
+    authorId: interaction.user.id,
+    casters: [],
+    cocasters: [],
+    cancelled: false,
+    channelId: null,
+    messageId: null,
+    threadId: null,
+    threadParentId: threadChannel.id,
+  };
+
+  // 1) create the private thread
+  let thread;
+  try {
+    thread = await createScrimThread(threadChannel, s);
+  } catch (e) {
+    console.error('Thread creation failed:', e.message);
+    return interaction.editReply({
+      content:
+        `I couldn't create the scrim thread in <#${threadChannel.id}>. Give me **Create Private Threads**, ` +
+        '**Send Messages in Threads** and **Manage Threads** there, then try again.',
+    });
+  }
+  s.threadId = thread.id;
+
+  // 2) post the scrim message (it links to the thread)
+  let msg;
+  try {
+    msg = await postChannel.send({
+      content: `<@&${cfg.casterRoleId}> new scrim up for casting!`,
+      embeds: [buildEmbed(s)],
+      components: [buildButtons(s)],
+      allowedMentions: { roles: [cfg.casterRoleId] },
+    });
+  } catch (e) {
+    console.error('Posting scrim failed:', e.message);
+    await thread.delete().catch(() => {});
+    return interaction.editReply({ content: `I couldn't post in <#${postChannel.id}>. Check my permissions there.` });
+  }
+
+  s.channelId = msg.channelId;
+  s.messageId = msg.id;
+  db.nextId += 1;
+  db.scrims[s.id] = s;
+  save();
+
+  // 3) put the poster in the thread and say hello
+  await thread.members.add(s.authorId).catch((e) => console.error('Could not add poster:', e.message));
+  await thread
+    .send({
+      content:
+        `**Scrim #${s.id}: ${s.team1} vs ${s.team2}** (${s.time})\n` +
+        `Posted by <@${s.authorId}>. The caster who claims this scrim is added here automatically.\n` +
+        `The caster can add up to ${MAX_COCASTERS} co-casters with \`/scrim addcocaster\`, and ping everyone here with \`/scrim ping\`.`,
+      allowedMentions: { parse: [] },
+    })
+    .catch((e) => console.error('Could not send thread intro:', e.message));
+
+  return interaction.editReply({ content: `Scrim #${s.id} posted in <#${s.channelId}>. Thread: <#${thread.id}>` });
+}
+
 const pingCooldown = new Map();
 
 // The bot owner is the owner of the Discord application (or a member of its team), or BOT_OWNER_ID if set
@@ -470,34 +616,59 @@ client.on('interactionCreate', async (interaction) => {
           if (!configComplete(c)) return interaction.editReply({ content: 'Not set up yet. Run `/setup set`.' });
           return interaction.editReply({
             content:
-              `**Scrim posts:** <#${c.postChannelId}>\n` +
+              `**Post Scrim panel:** ${c.panelChannelId ? `<#${c.panelChannelId}>` : 'not set, run `/setup set` again'}\n` +
+              `**Scrims are posted in:** <#${c.postChannelId}>\n` +
               `**Private threads are created in:** <#${c.threadChannelId}>\n` +
               `**Role that can claim:** <@&${c.casterRoleId}>`,
           });
         }
 
+        if (sub === 'panel') {
+          const c = getConfig(interaction.guildId);
+          if (!c || !c.panelChannelId) return interaction.editReply({ content: 'No panel channel is set. Run `/setup set` first.' });
+          const r = await postPanel(interaction.guildId);
+          return interaction.editReply({
+            content: r.ok
+              ? `Posted the Post Scrim panel in <#${c.panelChannelId}>.`
+              : `I couldn't post the panel in <#${c.panelChannelId}>: ${r.reason}`,
+          });
+        }
+
         // sub === 'set'
+        const panel = interaction.options.getChannel('panel_channel', true);
         const post = interaction.options.getChannel('post_channel', true);
         const threads = interaction.options.getChannel('thread_channel', true);
         const role = interaction.options.getRole('caster_role', true);
-        db.config[interaction.guildId] = { postChannelId: post.id, threadChannelId: threads.id, casterRoleId: role.id };
+        const previous = getConfig(interaction.guildId);
+        db.config[interaction.guildId] = {
+          panelChannelId: panel.id,
+          postChannelId: post.id,
+          threadChannelId: threads.id,
+          casterRoleId: role.id,
+          panelMessage: previous ? previous.panelMessage : undefined, // so the old panel can be replaced
+        };
         save();
 
         const me = interaction.guild.members.me || (await interaction.guild.members.fetchMe().catch(() => null));
         const warnings = [];
         if (me) {
+          const m0 = missingPerms(panel, me, ['ViewChannel', 'SendMessages', 'EmbedLinks']);
           const m1 = missingPerms(post, me, ['ViewChannel', 'SendMessages', 'EmbedLinks']);
           const m2 = missingPerms(threads, me, ['ViewChannel', 'CreatePrivateThreads', 'SendMessagesInThreads', 'ManageThreads']);
+          if (m0.length) warnings.push(`I'm missing in <#${panel.id}>: ${m0.join(', ')}`);
           if (m1.length) warnings.push(`I'm missing in <#${post.id}>: ${m1.join(', ')}`);
           if (m2.length) warnings.push(`I'm missing in <#${threads.id}>: ${m2.join(', ')}`);
         }
+        const panelResult = await postPanel(interaction.guildId);
+        if (!panelResult.ok) warnings.push(`I couldn't post the panel in <#${panel.id}>: ${panelResult.reason}. Fix it, then run \`/setup panel\`.`);
         return interaction.editReply({
           content:
             'Saved.\n' +
-            `**Scrim posts:** <#${post.id}>\n` +
+            `**Post Scrim panel:** <#${panel.id}>${panelResult.ok ? ' (posted)' : ''}\n` +
+            `**Scrims are posted in:** <#${post.id}>\n` +
             `**Private threads are created in:** <#${threads.id}>\n` +
             `**Role that can claim:** <@&${role.id}>\n\n` +
-            (warnings.length ? `Fix these permissions:\n- ${warnings.join('\n- ')}\n\n` : '') +
+            (warnings.length ? `Fix these:\n- ${warnings.join('\n- ')}\n\n` : '') +
             `Everyone who posts scrims or casts must be able to see <#${threads.id}> and send messages in threads there.`,
         });
       }
@@ -505,87 +676,6 @@ client.on('interactionCreate', async (interaction) => {
       // ===== /scrim ... =====
       if (interaction.commandName === 'scrim') {
         const sub = interaction.options.getSubcommand();
-
-        if (sub === 'post') {
-          await interaction.deferReply({ flags: EPHEMERAL });
-
-          const cfg = getConfig(interaction.guildId);
-          if (!configComplete(cfg)) {
-            return interaction.editReply({ content: 'This server is not set up yet. The server owner needs to run `/setup set` first.' });
-          }
-          const postChannel = await client.channels.fetch(cfg.postChannelId).catch(() => null);
-          const threadChannel = await client.channels.fetch(cfg.threadChannelId).catch(() => null);
-          if (!postChannel || !threadChannel) {
-            return interaction.editReply({ content: "I can't find the configured channels. The server owner should run `/setup set` again." });
-          }
-
-          const s = {
-            id: db.nextId,
-            guildId: interaction.guildId,
-            game: interaction.options.getString('game'),
-            team1: interaction.options.getString('team1'),
-            team2: interaction.options.getString('team2'),
-            time: interaction.options.getString('time'),
-            notes: interaction.options.getString('notes') || '',
-            authorId: interaction.user.id,
-            casters: [],
-            cocasters: [],
-            cancelled: false,
-            channelId: null,
-            messageId: null,
-            threadId: null,
-            threadParentId: threadChannel.id,
-          };
-
-          // 1) create the private thread
-          let thread;
-          try {
-            thread = await createScrimThread(threadChannel, s);
-          } catch (e) {
-            console.error('Thread creation failed:', e.message);
-            return interaction.editReply({
-              content:
-                `I couldn't create the scrim thread in <#${threadChannel.id}>. Give me **Create Private Threads**, ` +
-                '**Send Messages in Threads** and **Manage Threads** there, then try again.',
-            });
-          }
-          s.threadId = thread.id;
-
-          // 2) post the scrim message (it links to the thread)
-          let msg;
-          try {
-            msg = await postChannel.send({
-              content: `<@&${cfg.casterRoleId}> new scrim up for casting!`,
-              embeds: [buildEmbed(s)],
-              components: [buildButtons(s)],
-              allowedMentions: { roles: [cfg.casterRoleId] },
-            });
-          } catch (e) {
-            console.error('Posting scrim failed:', e.message);
-            await thread.delete().catch(() => {});
-            return interaction.editReply({ content: `I couldn't post in <#${postChannel.id}>. Check my permissions there.` });
-          }
-
-          s.channelId = msg.channelId;
-          s.messageId = msg.id;
-          db.nextId += 1;
-          db.scrims[s.id] = s;
-          save();
-
-          // 3) put the poster in the thread and say hello
-          await thread.members.add(s.authorId).catch((e) => console.error('Could not add poster:', e.message));
-          await thread
-            .send({
-              content:
-                `**Scrim #${s.id}: ${s.team1} vs ${s.team2}** (${s.time})\n` +
-                `Posted by <@${s.authorId}>. The caster who claims this scrim is added here automatically.\n` +
-                `The caster can add up to ${MAX_COCASTERS} co-casters with \`/scrim addcocaster\`, and ping everyone here with \`/scrim ping\`.`,
-              allowedMentions: { parse: [] },
-            })
-            .catch((e) => console.error('Could not send thread intro:', e.message));
-
-          return interaction.editReply({ content: `Scrim #${s.id} posted in <#${s.channelId}>. Thread: <#${thread.id}>` });
-        }
 
         if (sub === 'cancel') {
           await interaction.deferReply({ flags: EPHEMERAL });
@@ -687,6 +777,30 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
       return;
+    }
+
+    // ----- the "Post Scrim" button opens the form -----
+    if (interaction.isButton() && interaction.customId === 'postscrim') {
+      if (!interaction.guildId || !configComplete(getConfig(interaction.guildId))) {
+        return interaction.reply({
+          content: 'This server is not set up yet. The server owner needs to run `/setup set` first.',
+          flags: EPHEMERAL,
+        });
+      }
+      return interaction.showModal(buildScrimModal());
+    }
+
+    // ----- the submitted form creates the scrim -----
+    if (interaction.isModalSubmit && interaction.isModalSubmit() && interaction.customId === 'scrimform') {
+      await interaction.deferReply({ flags: EPHEMERAL });
+      const team1 = interaction.fields.getTextInputValue('team1').trim();
+      const team2 = interaction.fields.getTextInputValue('team2').trim();
+      const time = interaction.fields.getTextInputValue('time').trim();
+      const notes = (interaction.fields.getTextInputValue('notes') || '').trim();
+      if (!team1 || !team2 || !time) {
+        return interaction.editReply({ content: 'Team 1, Team 2 and When can\'t be empty. Press **Post Scrim** to try again.' });
+      }
+      return createScrim(interaction, { team1, team2, time, notes });
     }
 
     // ----- buttons -----
