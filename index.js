@@ -2,6 +2,24 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const { execFile } = require('child_process');
+
+// Keep the last few log lines in memory so the owner can read them with /admin logs
+const recentLogs = [];
+for (const level of ['log', 'warn', 'error']) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    original(...args);
+    try {
+      const line = args.map((a) => (typeof a === 'string' ? a : a instanceof Error ? a.message : JSON.stringify(a))).join(' ');
+      recentLogs.push(`${new Date().toISOString().slice(11, 19)} ${level === 'log' ? '' : level.toUpperCase() + ' '}${line}`.slice(0, 300));
+      if (recentLogs.length > 40) recentLogs.shift();
+    } catch {
+      /* never let logging break the bot */
+    }
+  };
+}
+
 const {
   Client,
   GatewayIntentBits,
@@ -33,6 +51,7 @@ const optionalId = (name) => {
 const TOKEN = clean(process.env.DISCORD_TOKEN).replace(/^Bot\s+/i, '');
 const CLIENT_ID = clean(process.env.CLIENT_ID);
 const GUILD_ID = optionalId('GUILD_ID'); // optional: makes slash commands update instantly in one server
+const BOT_OWNER_ID = optionalId('BOT_OWNER_ID'); // optional: who may use /admin (default: the bot application's owner)
 const STATUS_TEXT = clean(process.env.STATUS_TEXT).slice(0, 128) || 'Scrim Board | /scrim post'; // "Playing ..."
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 
@@ -134,6 +153,15 @@ const commands = [
         )
     )
     .addSubcommand((c) => c.setName('view').setDescription('Show the current setup'))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('admin')
+    .setDescription('Bot owner only: manage the bot itself')
+    .addSubcommand((c) => c.setName('status').setDescription('Show uptime, memory and scrim counts'))
+    .addSubcommand((c) => c.setName('logs').setDescription('Show the most recent log lines'))
+    .addSubcommand((c) => c.setName('restart').setDescription('Restart the bot (needs pm2 to come back by itself)'))
+    .addSubcommand((c) => c.setName('shutdown').setDescription('Turn the bot off (under pm2 it stays off until you start it again)'))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -317,10 +345,98 @@ async function refreshMessage(interaction, s) {
 
 const pingCooldown = new Map();
 
+// The bot owner is the owner of the Discord application (or a member of its team), or BOT_OWNER_ID if set
+async function isBotOwner(userId) {
+  if (BOT_OWNER_ID) return userId === BOT_OWNER_ID;
+  try {
+    const app = await client.application.fetch();
+    const o = app.owner;
+    if (!o) return false;
+    if (o.members) return o.ownerId === userId || o.members.has(userId); // a team
+    return o.id === userId;
+  } catch (e) {
+    console.error('Could not look up the bot owner:', e.message);
+    return false;
+  }
+}
+
+const underPm2 = () => process.env.pm_id !== undefined && process.env.pm_id !== '';
+const fmtUptime = (sec) => {
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+  return `${d ? d + 'd ' : ''}${h}h ${m}m`;
+};
+
+async function handleAdmin(interaction) {
+  if (!(await isBotOwner(interaction.user.id))) {
+    return interaction.reply({ content: 'Only the bot owner can use `/admin`.', flags: EPHEMERAL });
+  }
+  await interaction.deferReply({ flags: EPHEMERAL });
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'status') {
+    const all = Object.values(db.scrims);
+    const open = all.filter((s) => !s.cancelled && s.casters.length < MAX_CASTERS).length;
+    const mb = (n) => (n / 1048576).toFixed(0);
+    return interaction.editReply({
+      content:
+        '**Bot status**\n' +
+        `Uptime: ${fmtUptime(process.uptime())}\n` +
+        `Discord ping: ${Math.round(client.ws.ping)} ms\n` +
+        `Memory: ${mb(process.memoryUsage().rss)} MB\n` +
+        `Servers: ${client.guilds.cache.size}\n` +
+        `Scrims: ${all.length} total, ${open} waiting for a caster\n` +
+        `Running under pm2: ${underPm2() ? 'yes (restarts itself if it crashes)' : 'no'}\n` +
+        `Node ${process.version}`,
+    });
+  }
+
+  if (sub === 'logs') {
+    let text = recentLogs.slice(-15).join('\n') || '(no logs yet)';
+    if (text.length > 1800) text = '...' + text.slice(-1800);
+    return interaction.editReply({ content: '```\n' + text.replace(/```/g, "'''") + '\n```' });
+  }
+
+  if (sub === 'restart') {
+    if (!underPm2()) {
+      return interaction.editReply({
+        content: "I'm not running under pm2, so I wouldn't come back by myself. Start me with `pm2 start index.js --name scrim-bot` first.",
+      });
+    }
+    await interaction.editReply({ content: 'Restarting now. I should be back in a few seconds.' });
+    setTimeout(() => {
+      client.destroy();
+      process.exit(0); // pm2 starts it again
+    }, 500);
+    return;
+  }
+
+  if (sub === 'shutdown') {
+    await interaction.editReply({ content: 'Shutting down. Start me again from the Chromebook with `pm2 start scrim-bot`.' });
+    setTimeout(() => {
+      if (underPm2()) {
+        // `pm2 stop` keeps pm2 from restarting the process
+        execFile('pm2', ['stop', String(process.env.pm_id)], (err) => {
+          if (err) {
+            console.error('pm2 stop failed:', err.message);
+            client.destroy();
+            process.exit(0); // pm2 will restart it; better than leaving it half-dead
+          }
+        });
+      } else {
+        client.destroy();
+        process.exit(0);
+      }
+    }, 500);
+    return;
+  }
+}
+
 client.on('interactionCreate', async (interaction) => {
   try {
     // ----- slash commands -----
     if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'admin') return handleAdmin(interaction);
+
       if (!interaction.guildId || !interaction.guild) {
         return interaction.reply({ content: 'Use this command in a server.', flags: EPHEMERAL });
       }
