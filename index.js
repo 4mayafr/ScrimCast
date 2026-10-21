@@ -635,7 +635,15 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         // sub === 'set'
-        const panel = interaction.options.getChannel('panel_channel', true);
+        const panel = interaction.options.getChannel('panel_channel');
+        if (!panel) {
+          // Discord is still showing an older version of this command (no panel_channel option)
+          return interaction.editReply({
+            content:
+              'Your Discord app is still showing the old version of `/setup`. Restart Discord (Ctrl+R on PC, or close and reopen the app) ' +
+              'so it picks up the new `panel_channel` option, then run `/setup set` again. Nothing was changed.',
+          });
+        }
         const post = interaction.options.getChannel('post_channel', true);
         const threads = interaction.options.getChannel('thread_channel', true);
         const role = interaction.options.getRole('caster_role', true);
@@ -676,6 +684,17 @@ client.on('interactionCreate', async (interaction) => {
       // ===== /scrim ... =====
       if (interaction.commandName === 'scrim') {
         const sub = interaction.options.getSubcommand();
+
+        if (sub === 'post') {
+          // /scrim post was replaced by the Post Scrim button; this only runs if Discord still shows the old command
+          const c = getConfig(interaction.guildId);
+          return interaction.reply({
+            content: c && c.panelChannelId
+              ? `Scrims are posted with the **Post Scrim** button in <#${c.panelChannelId}> now. (If you still see \`/scrim post\`, restart Discord to refresh the commands.)`
+              : 'Scrims are posted with a **Post Scrim** button now. The server owner needs to run `/setup set` to create it.',
+            flags: EPHEMERAL,
+          });
+        }
 
         if (sub === 'cancel') {
           await interaction.deferReply({ flags: EPHEMERAL });
