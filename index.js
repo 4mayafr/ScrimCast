@@ -4,6 +4,13 @@ const path = require('path');
 const http = require('http');
 const { execFile } = require('child_process');
 
+// Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
+try {
+  require('dns').setDefaultResultOrder('ipv4first');
+} catch {
+  /* older Node: ignore */
+}
+
 // Keep the last few log lines in memory so the owner can read them with /admin logs
 const recentLogs = [];
 for (const level of ['log', 'warn', 'error']) {
@@ -34,7 +41,17 @@ const {
   MessageFlags,
   ChannelType,
   ActivityType,
+  Events,
 } = require('discord.js');
+
+// Short, readable version of an error (network errors can be huge AggregateErrors)
+const shortErr = (e) => {
+  if (!e) return 'unknown error';
+  const code = e.code ? `${e.code}` : '';
+  const msg = e.message ? `${e.message}` : '';
+  const many = Array.isArray(e.errors) ? ` (${e.errors.length} connection attempts failed)` : '';
+  return [code, msg].filter(Boolean).join(': ') + many || String(e);
+};
 
 // Clean up env values: strip spaces, quotes and an accidental "Bot " prefix
 const clean = (v) => (v || '').trim().replace(/^["']|["']$/g, '').trim();
@@ -245,9 +262,8 @@ async function onReady() {
     console.error('Command registration failed:', e);
   }
 }
-// 'clientReady' is the newer name; 'ready' is the older one. The guard above makes it safe to use both.
-client.once('clientReady', onReady);
-client.once('ready', onReady);
+// Events.ClientReady is 'ready' on older discord.js and 'clientReady' on newer, so no deprecation warning either way
+client.once(Events.ClientReady, onReady);
 
 // ---------- thread helpers ----------
 async function createScrimThread(channel, s) {
@@ -751,12 +767,12 @@ http
 
 console.log('DISCORD_TOKEN set:', Boolean(TOKEN), '| length:', TOKEN ? TOKEN.length : 0);
 console.log('CLIENT_ID set:', Boolean(CLIENT_ID));
-client.on('error', (e) => console.error('Client error:', e));
+client.on('error', (e) => console.error('Client error:', shortErr(e)));
 client.on('warn', (m) => console.warn('Client warn:', m));
-process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
+process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', shortErr(e)));
 client.rest.on('rateLimited', (info) => console.warn('[rateLimited]', JSON.stringify(info)));
 client.rest.on('invalidRequestWarning', (info) => console.warn('[invalidRequestWarning]', JSON.stringify(info)));
-client.on('shardError', (e) => console.error('[shardError]', e));
+client.on('shardError', (e) => console.error('[shardError]', shortErr(e)));
 client.on('shardDisconnect', (ev, id) => console.warn('[shardDisconnect]', id, ev && ev.code));
 
 // Ask Discord directly whether this server can reach it, and whether the token is accepted
@@ -778,22 +794,38 @@ async function preflight() {
   if (s === 429 || s === 403) console.error("[preflight] Discord is blocking or throttling this server's IP address.");
 }
 
-// If the bot hasn't connected after 2 minutes, exit so the host (pm2, Render...) restarts it
+const LOGIN_RETRY_MS = Number(process.env.LOGIN_RETRY_MS) || 15000;
+const GIVE_UP_AFTER_MS = Number(process.env.GIVE_UP_AFTER_MS) || 300000;
+
+// If the bot still isn't connected after 5 minutes, exit so the host (pm2, Render...) restarts it fresh
 setTimeout(() => {
   if (!client.isReady()) {
-    console.error('Not connected after 120s. Exiting so the host restarts the bot.');
+    console.error(`Not connected after ${Math.round(GIVE_UP_AFTER_MS / 1000)}s. Exiting so the host restarts the bot.`);
     process.exit(1);
   }
-}, 120000);
+}, GIVE_UP_AFTER_MS);
 
 (async () => {
   if (!TOKEN || !CLIENT_ID) {
     console.error('DISCORD_TOKEN and CLIENT_ID must both be set in the environment.');
   }
   await preflight();
-  console.log('Logging in...');
-  client
-    .login(TOKEN)
-    .then(() => console.log('Login request accepted'))
-    .catch((e) => console.error('LOGIN FAILED:', e.message));
+  // Flaky networks fail logins now and then, so retry instead of giving up on the first error
+  for (let attempt = 1; ; attempt++) {
+    console.log(`Logging in (attempt ${attempt})...`);
+    try {
+      await client.login(TOKEN);
+      console.log('Login request accepted');
+      break;
+    } catch (e) {
+      console.error('LOGIN FAILED:', shortErr(e));
+      if (e && e.code === 'TokenInvalid') {
+        console.error('The token is invalid. Reset it in the Discord Developer Portal and update DISCORD_TOKEN.');
+        process.exit(1);
+        return;
+      }
+      console.log(`Trying again in ${Math.round(LOGIN_RETRY_MS / 1000)}s...`);
+      await new Promise((r) => setTimeout(r, LOGIN_RETRY_MS));
+    }
+  }
 })();
