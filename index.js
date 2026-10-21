@@ -15,14 +15,27 @@ const {
   PermissionFlagsBits,
   MessageFlags,
 } = require('discord.js');
- 
-const TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID; // optional: faster command updates for one server
-const CASTER_ROLE_ID = process.env.CASTER_ROLE_ID; // optional: only this role can claim
-const SCRIM_CHANNEL_ID = process.env.SCRIM_CHANNEL_ID; // optional: always post here
+
+// Clean up env values: strip spaces, quotes and an accidental "Bot " prefix
+const clean = (v) => (v || '').trim().replace(/^["']|["']$/g, '').trim();
+// Optional IDs must be real Discord IDs (digits only); anything else is ignored
+const optionalId = (name) => {
+  const v = clean(process.env[name]);
+  if (!v) return undefined;
+  if (!/^\d{15,25}$/.test(v)) {
+    console.warn(`${name} is set but is not a valid ID, so it is being ignored.`);
+    return undefined;
+  }
+  return v;
+};
+
+const TOKEN = clean(process.env.DISCORD_TOKEN).replace(/^Bot\s+/i, '');
+const CLIENT_ID = clean(process.env.CLIENT_ID);
+const GUILD_ID = optionalId('GUILD_ID'); // optional: faster command updates for one server
+const CASTER_ROLE_ID = optionalId('CASTER_ROLE_ID'); // optional: only this role can claim
+const SCRIM_CHANNEL_ID = optionalId('SCRIM_CHANNEL_ID'); // optional: always post here
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
- 
+
 // ---------- tiny JSON storage ----------
 let db = { nextId: 1, scrims: {} };
 try {
@@ -33,7 +46,7 @@ try {
 function save() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
 }
- 
+
 // ---------- UI helpers ----------
 function buildEmbed(s) {
   const open = s.casters.length < s.slots && !s.cancelled;
@@ -52,7 +65,7 @@ function buildEmbed(s) {
   if (s.notes) embed.addFields({ name: 'Notes', value: s.notes });
   return embed;
 }
- 
+
 function buildButtons(s) {
   const full = s.casters.length >= s.slots;
   return new ActionRowBuilder().addComponents(
@@ -68,7 +81,7 @@ function buildButtons(s) {
       .setDisabled(s.cancelled)
   );
 }
- 
+
 // ---------- commands ----------
 const commands = [
   new SlashCommandBuilder()
@@ -97,7 +110,7 @@ const commands = [
     )
     .toJSON(),
 ];
- 
+
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   const route = GUILD_ID
@@ -106,29 +119,35 @@ async function registerCommands() {
   await rest.put(route, { body: commands });
   console.log('Slash commands registered');
 }
- 
+
 // ---------- bot ----------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
- 
-client.once('ready', async () => {
+
+let started = false;
+async function onReady() {
+  if (started) return;
+  started = true;
   console.log(`Logged in as ${client.user.tag}`);
   try {
     await registerCommands();
   } catch (e) {
     console.error('Command registration failed:', e);
   }
-});
- 
+}
+// 'clientReady' is the newer name; 'ready' is the older one. The guard above makes it safe to use both.
+client.once('clientReady', onReady);
+client.once('ready', onReady);
+
 async function refreshMessage(interaction, s) {
   await interaction.update({ embeds: [buildEmbed(s)], components: [buildButtons(s)] });
 }
- 
+
 client.on('interactionCreate', async (interaction) => {
   try {
     // ----- slash commands -----
     if (interaction.isChatInputCommand() && interaction.commandName === 'scrim') {
       const sub = interaction.options.getSubcommand();
- 
+
       if (sub === 'post') {
         const s = {
           id: db.nextId++,
@@ -144,12 +163,12 @@ client.on('interactionCreate', async (interaction) => {
           channelId: null,
           messageId: null,
         };
- 
+
         let channel = interaction.channel;
         if (SCRIM_CHANNEL_ID) {
           channel = (await client.channels.fetch(SCRIM_CHANNEL_ID).catch(() => null)) || channel;
         }
- 
+
         const content = CASTER_ROLE_ID ? `<@&${CASTER_ROLE_ID}> new scrim up for casting!` : 'New scrim up for casting!';
         const msg = await channel.send({
           content,
@@ -161,13 +180,13 @@ client.on('interactionCreate', async (interaction) => {
         s.messageId = msg.id;
         db.scrims[s.id] = s;
         save();
- 
+
         return interaction.reply({
           content: `Scrim #${s.id} posted in <#${s.channelId}>.`,
           flags: MessageFlags.Ephemeral,
         });
       }
- 
+
       if (sub === 'cancel') {
         const id = interaction.options.getInteger('id');
         const s = db.scrims[id];
@@ -187,7 +206,7 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: `Scrim #${id} cancelled.`, flags: MessageFlags.Ephemeral });
       }
     }
- 
+
     // ----- buttons -----
     if (interaction.isButton()) {
       const [action, idStr] = interaction.customId.split(':');
@@ -197,7 +216,7 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: 'This scrim is no longer available.', flags: MessageFlags.Ephemeral });
       }
       const uid = interaction.user.id;
- 
+
       if (action === 'claim') {
         if (CASTER_ROLE_ID && !interaction.member.roles.cache.has(CASTER_ROLE_ID)) {
           return interaction.reply({
@@ -228,7 +247,7 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 });
- 
+
 // Tiny web server so uptime pingers / "web service" hosts stay happy
 http
   .createServer((_, res) => {
@@ -236,7 +255,7 @@ http
     res.end('Scrim bot is running');
   })
   .listen(process.env.PORT || 3000);
- 
+
 console.log('DISCORD_TOKEN set:', Boolean(TOKEN), '| length:', TOKEN ? TOKEN.length : 0);
 console.log('CLIENT_ID set:', Boolean(CLIENT_ID));
 client.on('error', (e) => console.error('Client error:', e));
@@ -247,12 +266,41 @@ client.rest.on('rateLimited', (info) => console.warn('[rateLimited]', JSON.strin
 client.rest.on('invalidRequestWarning', (info) => console.warn('[invalidRequestWarning]', JSON.stringify(info)));
 client.on('shardError', (e) => console.error('[shardError]', e));
 client.on('shardDisconnect', (ev, id) => console.warn('[shardDisconnect]', id, ev && ev.code));
+// Ask Discord directly whether this server can reach it, and whether the token is accepted
+async function preflight() {
+  const show = async (label, url, headers) => {
+    try {
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
+      const body = (await r.text()).replace(/\s+/g, ' ').slice(0, 160);
+      console.log(`[preflight] ${label}: HTTP ${r.status} ${r.statusText} | ${body}`);
+      return r.status;
+    } catch (e) {
+      console.error(`[preflight] ${label}: FAILED (${e.cause?.code || e.name}: ${e.message})`);
+      return 0;
+    }
+  };
+  await show('discord api reachable', 'https://discord.com/api/v10/gateway');
+  const s = await show('token check', 'https://discord.com/api/v10/users/@me', { Authorization: `Bot ${TOKEN}` });
+  if (s === 401) console.error('[preflight] Discord says the token is INVALID. Reset it in the Bot tab and update DISCORD_TOKEN.');
+  if (s === 429 || s === 403) console.error('[preflight] Discord is blocking or throttling this server\'s IP address.');
+}
+
+// If the bot hasn't connected after 2 minutes, exit so Render restarts it (often on a different IP)
 setTimeout(() => {
-  if (!client.isReady()) console.warn('Still not connected after 45s');
-}, 45000);
-console.log('Logging in...');
-client
-  .login(TOKEN)
-  .then(() => console.log('Login request accepted'))
-  .catch((e) => console.error('LOGIN FAILED:', e.message));
- 
+  if (!client.isReady()) {
+    console.error('Not connected after 120s. Exiting so the host restarts the bot.');
+    process.exit(1);
+  }
+}, 120000);
+
+(async () => {
+  if (!TOKEN || !CLIENT_ID) {
+    console.error('DISCORD_TOKEN and CLIENT_ID must both be set in the environment.');
+  }
+  await preflight();
+  console.log('Logging in...');
+  client
+    .login(TOKEN)
+    .then(() => console.log('Login request accepted'))
+    .catch((e) => console.error('LOGIN FAILED:', e.message));
+})();
