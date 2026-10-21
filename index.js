@@ -15,14 +15,14 @@ const {
   PermissionFlagsBits,
   MessageFlags,
 } = require('discord.js');
-
+ 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID; // optional: faster command updates for one server
 const CASTER_ROLE_ID = process.env.CASTER_ROLE_ID; // optional: only this role can claim
 const SCRIM_CHANNEL_ID = process.env.SCRIM_CHANNEL_ID; // optional: always post here
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
-
+ 
 // ---------- tiny JSON storage ----------
 let db = { nextId: 1, scrims: {} };
 try {
@@ -33,7 +33,7 @@ try {
 function save() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
 }
-
+ 
 // ---------- UI helpers ----------
 function buildEmbed(s) {
   const open = s.casters.length < s.slots && !s.cancelled;
@@ -52,7 +52,7 @@ function buildEmbed(s) {
   if (s.notes) embed.addFields({ name: 'Notes', value: s.notes });
   return embed;
 }
-
+ 
 function buildButtons(s) {
   const full = s.casters.length >= s.slots;
   return new ActionRowBuilder().addComponents(
@@ -68,7 +68,7 @@ function buildButtons(s) {
       .setDisabled(s.cancelled)
   );
 }
-
+ 
 // ---------- commands ----------
 const commands = [
   new SlashCommandBuilder()
@@ -97,7 +97,7 @@ const commands = [
     )
     .toJSON(),
 ];
-
+ 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   const route = GUILD_ID
@@ -106,10 +106,10 @@ async function registerCommands() {
   await rest.put(route, { body: commands });
   console.log('Slash commands registered');
 }
-
+ 
 // ---------- bot ----------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
+ 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
@@ -118,17 +118,17 @@ client.once('ready', async () => {
     console.error('Command registration failed:', e);
   }
 });
-
+ 
 async function refreshMessage(interaction, s) {
   await interaction.update({ embeds: [buildEmbed(s)], components: [buildButtons(s)] });
 }
-
+ 
 client.on('interactionCreate', async (interaction) => {
   try {
     // ----- slash commands -----
     if (interaction.isChatInputCommand() && interaction.commandName === 'scrim') {
       const sub = interaction.options.getSubcommand();
-
+ 
       if (sub === 'post') {
         const s = {
           id: db.nextId++,
@@ -144,12 +144,12 @@ client.on('interactionCreate', async (interaction) => {
           channelId: null,
           messageId: null,
         };
-
+ 
         let channel = interaction.channel;
         if (SCRIM_CHANNEL_ID) {
           channel = (await client.channels.fetch(SCRIM_CHANNEL_ID).catch(() => null)) || channel;
         }
-
+ 
         const content = CASTER_ROLE_ID ? `<@&${CASTER_ROLE_ID}> new scrim up for casting!` : 'New scrim up for casting!';
         const msg = await channel.send({
           content,
@@ -161,13 +161,13 @@ client.on('interactionCreate', async (interaction) => {
         s.messageId = msg.id;
         db.scrims[s.id] = s;
         save();
-
+ 
         return interaction.reply({
           content: `Scrim #${s.id} posted in <#${s.channelId}>.`,
           flags: MessageFlags.Ephemeral,
         });
       }
-
+ 
       if (sub === 'cancel') {
         const id = interaction.options.getInteger('id');
         const s = db.scrims[id];
@@ -187,7 +187,7 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: `Scrim #${id} cancelled.`, flags: MessageFlags.Ephemeral });
       }
     }
-
+ 
     // ----- buttons -----
     if (interaction.isButton()) {
       const [action, idStr] = interaction.customId.split(':');
@@ -197,7 +197,7 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: 'This scrim is no longer available.', flags: MessageFlags.Ephemeral });
       }
       const uid = interaction.user.id;
-
+ 
       if (action === 'claim') {
         if (CASTER_ROLE_ID && !interaction.member.roles.cache.has(CASTER_ROLE_ID)) {
           return interaction.reply({
@@ -228,7 +228,7 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 });
-
+ 
 // Tiny web server so uptime pingers / "web service" hosts stay happy
 http
   .createServer((_, res) => {
@@ -236,14 +236,23 @@ http
     res.end('Scrim bot is running');
   })
   .listen(process.env.PORT || 3000);
-
+ 
 console.log('DISCORD_TOKEN set:', Boolean(TOKEN), '| length:', TOKEN ? TOKEN.length : 0);
 console.log('CLIENT_ID set:', Boolean(CLIENT_ID));
 client.on('error', (e) => console.error('Client error:', e));
 client.on('warn', (m) => console.warn('Client warn:', m));
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
+client.on('debug', (m) => console.log('[debug]', m));
+client.rest.on('rateLimited', (info) => console.warn('[rateLimited]', JSON.stringify(info)));
+client.rest.on('invalidRequestWarning', (info) => console.warn('[invalidRequestWarning]', JSON.stringify(info)));
+client.on('shardError', (e) => console.error('[shardError]', e));
+client.on('shardDisconnect', (ev, id) => console.warn('[shardDisconnect]', id, ev && ev.code));
+setTimeout(() => {
+  if (!client.isReady()) console.warn('Still not connected after 45s');
+}, 45000);
 console.log('Logging in...');
 client
   .login(TOKEN)
   .then(() => console.log('Login request accepted'))
   .catch((e) => console.error('LOGIN FAILED:', e.message));
+ 
