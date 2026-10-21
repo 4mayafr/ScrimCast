@@ -237,4 +237,13 @@ http
   })
   .listen(process.env.PORT || 3000);
 
-client.login(TOKEN);
+console.log('DISCORD_TOKEN set:', Boolean(TOKEN), '| length:', TOKEN ? TOKEN.length : 0);
+console.log('CLIENT_ID set:', Boolean(CLIENT_ID));
+client.on('error', (e) => console.error('Client error:', e));
+client.on('warn', (m) => console.warn('Client warn:', m));
+process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
+console.log('Logging in...');
+client
+  .login(TOKEN)
+  .then(() => console.log('Login request accepted'))
+  .catch((e) => console.error('LOGIN FAILED:', e.message));
