@@ -5,7 +5,7 @@ const http = require('http');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-6'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-7'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -86,6 +86,7 @@ const EPHEMERAL = MessageFlags.Ephemeral;
 const MAX_CASTERS = 1; // casters per scrim
 const MAX_COCASTERS = 4; // co-casters per scrim
 const PING_COOLDOWN_MS = 10000;
+const SERVER_LOG_EVERY_MS = Number(process.env.SERVER_LOG_EVERY_MS) || 60000; // how often the live server log is refreshed
 
 // ---------- tiny JSON storage ----------
 let db = { nextId: 1, scrims: {}, config: {} };
@@ -218,7 +219,14 @@ const commands = [
         .addRoleOption((o) =>
           o.setName('caster_role').setDescription('Only this role can use the Claim button').setRequired(true)
         )
+        .addChannelOption((o) =>
+          o
+            .setName('server_log_channel')
+            .setDescription('Optional: private channel for a live bot/server log that updates every minute')
+            .addChannelTypes(ChannelType.GuildText)
+        )
     )
+    .addSubcommand((c) => c.setName('serverlogs_off').setDescription('Turn the live server log off'))
     .addSubcommand((c) => c.setName('view').setDescription('Show the current setup'))
     .addSubcommand((c) => c.setName('panel').setDescription('Post the "Post Scrim" panel again (for example if it was deleted)'))
     .toJSON(),
@@ -314,6 +322,9 @@ async function onReady() {
   } catch (e) {
     console.error('Could not set status:', e.message);
   }
+  // Keep the live server log fresh (one message per server, edited every minute)
+  updateServerLogs();
+  setInterval(updateServerLogs, SERVER_LOG_EVERY_MS).unref();
   try {
     await registerCommands();
   } catch (e) {
@@ -608,6 +619,76 @@ const fmtUptime = (sec) => {
   return `${d ? d + 'd ' : ''}${h}h ${m}m`;
 };
 
+// ---------- live server log (one message, edited every minute) ----------
+function buildServerLogEmbed() {
+  const mb = (n) => Math.round(n / 1048576);
+  const all = Object.values(db.scrims);
+  const open = all.filter((s) => !isClosed(s) && s.casters.length < MAX_CASTERS).length;
+  let lines = recentLogs.slice(-20).join('\n') || '(no logs yet)';
+  if (lines.length > 3000) lines = '...' + lines.slice(-3000);
+  return new EmbedBuilder()
+    .setTitle('Bot server log')
+    .setColor(0x2b2d31)
+    .setDescription(
+      `Updated <t:${Math.floor(Date.now() / 1000)}:R> (refreshes every ${Math.round(SERVER_LOG_EVERY_MS / 1000)}s. If this goes stale, the bot or its server is down.)\n` +
+        '```\n' + lines.replace(/```/g, "'''") + '\n```'
+    )
+    .addFields(
+      { name: 'Host', value: `${os.hostname()} (${process.platform})`, inline: true },
+      { name: 'Uptime', value: fmtUptime(process.uptime()), inline: true },
+      { name: 'Discord ping', value: `${Math.round(client.ws.ping)} ms`, inline: true },
+      { name: 'Memory', value: `bot ${mb(process.memoryUsage().rss)} MB, host free ${mb(os.freemem())} of ${mb(os.totalmem())} MB`, inline: true },
+      { name: 'Load (1 min)', value: os.loadavg()[0].toFixed(2), inline: true },
+      { name: 'Scrims', value: `${all.length} total, ${open} waiting for a caster`, inline: true },
+      { name: 'Version', value: `${CODE_VERSION}${underPm2() ? ' · pm2' : ''}`, inline: true }
+    );
+}
+
+// Edits the live server log message for one server, posting a new one if there isn't one yet. Throws if it can't post.
+async function updateServerLogFor(cfg) {
+  const ch = await client.channels.fetch(cfg.serverLogChannelId).catch(() => null);
+  if (!ch) throw new Error("can't find the server log channel");
+  const payload = { embeds: [buildServerLogEmbed()], allowedMentions: { parse: [] } };
+  const m = cfg.serverLogMessage;
+  if (m && m.channelId === cfg.serverLogChannelId) {
+    const msg = await ch.messages.fetch(m.messageId).catch(() => null);
+    if (msg) {
+      await msg.edit(payload);
+      return;
+    }
+  }
+  const sent = await ch.send(payload); // first time, or the old message was deleted
+  cfg.serverLogMessage = { channelId: sent.channelId, messageId: sent.id };
+  save();
+}
+
+async function removeServerLogMessage(cfg) {
+  const m = cfg && cfg.serverLogMessage;
+  if (!m) return;
+  const ch = await client.channels.fetch(m.channelId).catch(() => null);
+  const msg = ch && (await ch.messages.fetch(m.messageId).catch(() => null));
+  if (msg) await msg.delete().catch(() => {});
+  cfg.serverLogMessage = undefined;
+}
+
+let serverLogBusy = false;
+async function updateServerLogs() {
+  if (serverLogBusy) return; // the previous round is still running
+  serverLogBusy = true;
+  try {
+    for (const cfg of Object.values(db.config)) {
+      if (!cfg || !cfg.serverLogChannelId) continue;
+      try {
+        await updateServerLogFor(cfg);
+      } catch (e) {
+        console.error('Server log update failed:', e.message);
+      }
+    }
+  } finally {
+    serverLogBusy = false;
+  }
+}
+
 async function handleAdmin(interaction) {
   if (!(await isBotOwner(interaction.user.id))) {
     return interaction.reply({ content: 'Only the bot owner can use `/admin`.', flags: EPHEMERAL });
@@ -748,6 +829,7 @@ client.on('interactionCreate', async (interaction) => {
               `**Post Scrim panel:** ${c.panelChannelId ? `<#${c.panelChannelId}>` : 'not set, run `/setup set` again'}\n` +
               `**Scrims are posted in:** <#${c.postChannelId}>\n` +
               `**Log channel:** ${c.logChannelId ? `<#${c.logChannelId}>` : 'not set, run `/setup set` again'}\n` +
+              `**Live server log:** ${c.serverLogChannelId ? `<#${c.serverLogChannelId}> (updates every minute)` : 'off'}\n` +
               `**Private threads are created in:** <#${c.threadChannelId}>\n` +
               `**Role that can claim:** <@&${c.casterRoleId}>`,
           });
@@ -764,6 +846,15 @@ client.on('interactionCreate', async (interaction) => {
           });
         }
 
+        if (sub === 'serverlogs_off') {
+          const c = getConfig(interaction.guildId);
+          if (!c || !c.serverLogChannelId) return interaction.editReply({ content: 'The live server log is already off.' });
+          await removeServerLogMessage(c);
+          c.serverLogChannelId = undefined;
+          save();
+          return interaction.editReply({ content: 'Turned the live server log off and removed its message.' });
+        }
+
         // sub === 'set'
         const panel = interaction.options.getChannel('panel_channel');
         const logCh = interaction.options.getChannel('log_channel');
@@ -778,7 +869,11 @@ client.on('interactionCreate', async (interaction) => {
         const post = interaction.options.getChannel('post_channel', true);
         const threads = interaction.options.getChannel('thread_channel', true);
         const role = interaction.options.getRole('caster_role', true);
+        const serverLog = interaction.options.getChannel('server_log_channel'); // optional
         const previous = getConfig(interaction.guildId);
+        // Leaving server_log_channel out keeps whatever was set before; picking a different channel moves the live message
+        const keepServerLog = !serverLog || (previous && previous.serverLogChannelId === serverLog.id);
+        if (previous && !keepServerLog) await removeServerLogMessage(previous);
         db.config[interaction.guildId] = {
           panelChannelId: panel.id,
           logChannelId: logCh.id,
@@ -786,6 +881,8 @@ client.on('interactionCreate', async (interaction) => {
           threadChannelId: threads.id,
           casterRoleId: role.id,
           panelMessage: previous ? previous.panelMessage : undefined, // so the old panel can be replaced
+          serverLogChannelId: serverLog ? serverLog.id : previous ? previous.serverLogChannelId : undefined,
+          serverLogMessage: keepServerLog && previous ? previous.serverLogMessage : undefined,
         };
         save();
 
@@ -800,17 +897,30 @@ client.on('interactionCreate', async (interaction) => {
           if (m2.length) warnings.push(`I'm missing in <#${threads.id}>: ${m2.join(', ')}`);
           const m3 = missingPerms(logCh, me, ['ViewChannel', 'SendMessages', 'EmbedLinks']);
           if (m3.length) warnings.push(`I'm missing in <#${logCh.id}>: ${m3.join(', ')}`);
+          if (serverLog) {
+            const m4 = missingPerms(serverLog, me, ['ViewChannel', 'SendMessages', 'EmbedLinks']);
+            if (m4.length) warnings.push(`I'm missing in <#${serverLog.id}>: ${m4.join(', ')}`);
+          }
         }
         const logOk = await logEvent(interaction.guildId, 'Logging enabled', 'Scrim activity (posted, claimed, closed...) will be logged here.', 0x57f287);
         if (!logOk) warnings.push(`I couldn't post in the log channel <#${logCh.id}>. Check my permissions there.`);
         const panelResult = await postPanel(interaction.guildId);
         if (!panelResult.ok) warnings.push(`I couldn't post the panel in <#${panel.id}>: ${panelResult.reason}. Fix it, then run \`/setup panel\`.`);
+        const serverLogId = db.config[interaction.guildId].serverLogChannelId;
+        if (serverLogId) {
+          try {
+            await updateServerLogFor(db.config[interaction.guildId]); // posts the live message right away
+          } catch (e) {
+            warnings.push(`I couldn't post the live server log in <#${serverLogId}>: ${e.message}`);
+          }
+        }
         return interaction.editReply({
           content:
             'Saved.\n' +
             `**Post Scrim panel:** <#${panel.id}>${panelResult.ok ? ' (posted)' : ''}\n` +
             `**Scrims are posted in:** <#${post.id}>\n` +
             `**Log channel:** <#${logCh.id}>\n` +
+            `**Live server log:** ${serverLogId ? `<#${serverLogId}> (updates every minute)` : 'off (add the optional server_log_channel to turn it on)'}\n` +
             `**Private threads are created in:** <#${threads.id}>\n` +
             `**Role that can claim:** <@&${role.id}>\n\n` +
             (warnings.length ? `Fix these:\n- ${warnings.join('\n- ')}\n\n` : '') +
