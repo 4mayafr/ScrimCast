@@ -5,7 +5,7 @@ const http = require('http');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-8'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-9'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -293,7 +293,7 @@ const commands = [
             .addChannelTypes(ChannelType.GuildText)
         )
         .addStringOption((o) =>
-          o.setName('timezone').setDescription('Optional: timezone used to read scrim times, e.g. Australia/Melbourne or America/New_York (default UTC)')
+          o.setName('timezone').setDescription('Optional: timezone for scrim times, e.g. Australia/Melbourne (default UTC)')
         )
     )
     .addSubcommand((c) => c.setName('serverlogs_off').setDescription('Turn the live server log off'))
