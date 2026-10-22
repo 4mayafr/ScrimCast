@@ -5,7 +5,7 @@ const http = require('http');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-5'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-6'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -103,14 +103,33 @@ function save() {
 
 const getConfig = (guildId) => db.config[guildId] || null;
 const configComplete = (c) => Boolean(c && c.postChannelId && c.threadChannelId && c.casterRoleId);
+const isClosed = (s) => Boolean(s.closed || s.cancelled); // older versions called it "cancelled"
+
+// Writes one line to the server's log channel (if one is set). Returns true if it was sent.
+async function logEvent(guildId, title, description, color = 0x5865f2) {
+  try {
+    const cfg = getConfig(guildId);
+    if (!cfg || !cfg.logChannelId) return false;
+    const ch = await client.channels.fetch(cfg.logChannelId).catch(() => null);
+    if (!ch) return false;
+    await ch.send({
+      embeds: [new EmbedBuilder().setTitle(title).setDescription(description).setColor(color).setTimestamp()],
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  } catch (e) {
+    console.error('Could not write to the log channel:', e.message);
+    return false;
+  }
+}
 
 // ---------- UI helpers ----------
 function buildEmbed(s) {
   const cocasters = s.cocasters || [];
-  const open = s.casters.length < MAX_CASTERS && !s.cancelled;
+  const open = s.casters.length < MAX_CASTERS && !isClosed(s);
   const embed = new EmbedBuilder()
     .setTitle(`${s.team1} vs ${s.team2}`)
-    .setColor(s.cancelled ? 0x808080 : open ? 0x57f287 : 0xed4245)
+    .setColor(isClosed(s) ? 0x808080 : open ? 0x57f287 : 0xed4245)
     .addFields(
       { name: 'When', value: s.time, inline: true },
       { name: 'Posted by', value: `<@${s.authorId}>`, inline: true },
@@ -123,7 +142,7 @@ function buildEmbed(s) {
         value: cocasters.length ? cocasters.map((id) => `<@${id}>`).join('\n') : '*None yet*',
       }
     )
-    .setFooter({ text: `Scrim #${s.id}${s.cancelled ? ' · CANCELLED' : ''}` });
+    .setFooter({ text: `Scrim #${s.id}${isClosed(s) ? ' · CLOSED' : ''}` });
   if (s.threadId) {
     embed.addFields({ name: 'Thread', value: `<#${s.threadId}> (private: poster, caster and co-casters)` });
   }
@@ -138,12 +157,23 @@ function buildButtons(s) {
       .setCustomId(`claim:${s.id}`)
       .setLabel(full ? 'Claimed' : 'Claim as Caster')
       .setStyle(ButtonStyle.Success)
-      .setDisabled(full || s.cancelled),
+      .setDisabled(full || isClosed(s)),
     new ButtonBuilder()
       .setCustomId(`unclaim:${s.id}`)
       .setLabel('Unclaim')
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(s.cancelled)
+      .setDisabled(isClosed(s))
+  );
+}
+
+// The "Close Scrim" button that lives inside the scrim's private thread
+function buildCloseRow(s, closed = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`close:${s.id}`)
+      .setLabel(closed ? 'Closed' : 'Close Scrim')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(closed)
   );
 }
 
@@ -178,6 +208,13 @@ const commands = [
             .addChannelTypes(ChannelType.GuildText)
             .setRequired(true)
         )
+        .addChannelOption((o) =>
+          o
+            .setName('log_channel')
+            .setDescription('Channel where scrim activity is logged (posted, claimed, closed...)')
+            .addChannelTypes(ChannelType.GuildText)
+            .setRequired(true)
+        )
         .addRoleOption((o) =>
           o.setName('caster_role').setDescription('Only this role can use the Claim button').setRequired(true)
         )
@@ -204,12 +241,6 @@ const commands = [
   new SlashCommandBuilder()
     .setName('scrim')
     .setDescription('Scrim board')
-    .addSubcommand((c) =>
-      c
-        .setName('cancel')
-        .setDescription('Cancel a scrim you posted')
-        .addIntegerOption((o) => o.setName('id').setDescription('Scrim number').setRequired(true))
-    )
     .addSubcommand((c) =>
       c
         .setName('addcocaster')
@@ -366,8 +397,8 @@ async function scrimForThreadCommand(interaction) {
     });
     return null;
   }
-  if (s.cancelled) {
-    await interaction.editReply({ content: 'That scrim was cancelled.' });
+  if (isClosed(s)) {
+    await interaction.editReply({ content: 'That scrim is closed.' });
     return null;
   }
   if (!s.threadId) {
@@ -476,7 +507,7 @@ async function createScrim(interaction, { team1, team2, time, notes }) {
     authorId: interaction.user.id,
     casters: [],
     cocasters: [],
-    cancelled: false,
+    closed: false,
     channelId: null,
     messageId: null,
     threadId: null,
@@ -525,10 +556,18 @@ async function createScrim(interaction, { team1, team2, time, notes }) {
       content:
         `**Scrim #${s.id}: ${s.team1} vs ${s.team2}** (${s.time})\n` +
         `Posted by <@${s.authorId}>. The caster who claims this scrim is added here automatically.\n` +
-        `The caster can add up to ${MAX_COCASTERS} co-casters with \`/scrim addcocaster\`, and ping everyone here with \`/scrim ping\`.`,
+        `The caster can add up to ${MAX_COCASTERS} co-casters with \`/scrim addcocaster\`, and ping everyone here with \`/scrim ping\`.\n` +
+        'Press **Close Scrim** below when the scrim is over.',
+      components: [buildCloseRow(s)],
       allowedMentions: { parse: [] },
     })
     .catch((e) => console.error('Could not send thread intro:', e.message));
+  await logEvent(
+    s.guildId,
+    `Scrim #${s.id} posted`,
+    `**${s.team1} vs ${s.team2}** at ${s.time}\nPosted by <@${s.authorId}> in <#${s.channelId}>. Thread: <#${s.threadId}>`,
+    0x5865f2
+  );
 
   return interaction.editReply({ content: `Scrim #${s.id} posted in <#${s.channelId}>. Thread: <#${thread.id}>` });
 }
@@ -578,7 +617,7 @@ async function handleAdmin(interaction) {
 
   if (sub === 'status') {
     const all = Object.values(db.scrims);
-    const open = all.filter((s) => !s.cancelled && s.casters.length < MAX_CASTERS).length;
+    const open = all.filter((s) => !isClosed(s) && s.casters.length < MAX_CASTERS).length;
     const mb = (n) => (n / 1048576).toFixed(0);
     return interaction.editReply({
       content:
@@ -708,6 +747,7 @@ client.on('interactionCreate', async (interaction) => {
             content:
               `**Post Scrim panel:** ${c.panelChannelId ? `<#${c.panelChannelId}>` : 'not set, run `/setup set` again'}\n` +
               `**Scrims are posted in:** <#${c.postChannelId}>\n` +
+              `**Log channel:** ${c.logChannelId ? `<#${c.logChannelId}>` : 'not set, run `/setup set` again'}\n` +
               `**Private threads are created in:** <#${c.threadChannelId}>\n` +
               `**Role that can claim:** <@&${c.casterRoleId}>`,
           });
@@ -726,12 +766,13 @@ client.on('interactionCreate', async (interaction) => {
 
         // sub === 'set'
         const panel = interaction.options.getChannel('panel_channel');
-        if (!panel) {
-          // Discord is still showing an older version of this command (no panel_channel option)
+        const logCh = interaction.options.getChannel('log_channel');
+        if (!panel || !logCh) {
+          // Discord is still showing an older version of this command (missing the newer channel options)
           return interaction.editReply({
             content:
-              'Your Discord app is still showing the old version of `/setup`. Restart Discord (Ctrl+R on PC, or close and reopen the app) ' +
-              'so it picks up the new `panel_channel` option, then run `/setup set` again. Nothing was changed.',
+              'Your Discord app is still showing an old version of `/setup`. Restart Discord (Ctrl+R on PC, or close and reopen the app) ' +
+              'so it picks up the new options (`panel_channel` and `log_channel`), then run `/setup set` again. Nothing was changed.',
           });
         }
         const post = interaction.options.getChannel('post_channel', true);
@@ -740,6 +781,7 @@ client.on('interactionCreate', async (interaction) => {
         const previous = getConfig(interaction.guildId);
         db.config[interaction.guildId] = {
           panelChannelId: panel.id,
+          logChannelId: logCh.id,
           postChannelId: post.id,
           threadChannelId: threads.id,
           casterRoleId: role.id,
@@ -756,7 +798,11 @@ client.on('interactionCreate', async (interaction) => {
           if (m0.length) warnings.push(`I'm missing in <#${panel.id}>: ${m0.join(', ')}`);
           if (m1.length) warnings.push(`I'm missing in <#${post.id}>: ${m1.join(', ')}`);
           if (m2.length) warnings.push(`I'm missing in <#${threads.id}>: ${m2.join(', ')}`);
+          const m3 = missingPerms(logCh, me, ['ViewChannel', 'SendMessages', 'EmbedLinks']);
+          if (m3.length) warnings.push(`I'm missing in <#${logCh.id}>: ${m3.join(', ')}`);
         }
+        const logOk = await logEvent(interaction.guildId, 'Logging enabled', 'Scrim activity (posted, claimed, closed...) will be logged here.', 0x57f287);
+        if (!logOk) warnings.push(`I couldn't post in the log channel <#${logCh.id}>. Check my permissions there.`);
         const panelResult = await postPanel(interaction.guildId);
         if (!panelResult.ok) warnings.push(`I couldn't post the panel in <#${panel.id}>: ${panelResult.reason}. Fix it, then run \`/setup panel\`.`);
         return interaction.editReply({
@@ -764,6 +810,7 @@ client.on('interactionCreate', async (interaction) => {
             'Saved.\n' +
             `**Post Scrim panel:** <#${panel.id}>${panelResult.ok ? ' (posted)' : ''}\n` +
             `**Scrims are posted in:** <#${post.id}>\n` +
+            `**Log channel:** <#${logCh.id}>\n` +
             `**Private threads are created in:** <#${threads.id}>\n` +
             `**Role that can claim:** <@&${role.id}>\n\n` +
             (warnings.length ? `Fix these:\n- ${warnings.join('\n- ')}\n\n` : '') +
@@ -787,22 +834,11 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (sub === 'cancel') {
-          await interaction.deferReply({ flags: EPHEMERAL });
-          const id = interaction.options.getInteger('id');
-          const s = db.scrims[id];
-          if (!s) return interaction.editReply({ content: 'Scrim not found.' });
-          if (s.authorId !== interaction.user.id && !isMod(interaction)) {
-            return interaction.editReply({ content: 'Only the poster or a moderator can cancel this.' });
-          }
-          s.cancelled = true;
-          save();
-          await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
-          const t = await getThread(s);
-          if (t) {
-            await t.send({ content: 'This scrim was cancelled. Archiving the thread.', allowedMentions: { parse: [] } }).catch(() => {});
-            await t.setArchived(true).catch(() => {});
-          }
-          return interaction.editReply({ content: `Scrim #${id} cancelled.` });
+          // /scrim cancel was replaced by the Close Scrim button; this only runs if Discord still shows the old command
+          return interaction.reply({
+            content: 'Scrims are closed with the **Close Scrim** button inside the scrim thread now. (If you still see `/scrim cancel`, restart Discord to refresh the commands.)',
+            flags: EPHEMERAL,
+          });
         }
 
         if (sub === 'addcocaster' || sub === 'removecocaster') {
@@ -840,6 +876,7 @@ client.on('interactionCreate', async (interaction) => {
             s.cocasters.push(target.id);
             save();
             await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
+            logEvent(s.guildId || interaction.guildId, `Scrim #${s.id} co-caster added`, `<@${uid}> added <@${target.id}> as a co-caster on **${s.team1} vs ${s.team2}**.`, 0x5865f2);
             return interaction.editReply({ content: `Added <@${target.id}> as a co-caster. Thread: <#${s.threadId}>` });
           }
 
@@ -851,6 +888,7 @@ client.on('interactionCreate', async (interaction) => {
           s.cocasters = s.cocasters.filter((id) => id !== target.id);
           save();
           await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
+          logEvent(s.guildId || interaction.guildId, `Scrim #${s.id} co-caster removed`, `<@${uid}> removed <@${target.id}> as a co-caster on **${s.team1} vs ${s.team2}**.`, 0x5865f2);
           return interaction.editReply({ content: `Removed <@${target.id}> as a co-caster.` });
         }
 
@@ -915,12 +953,38 @@ client.on('interactionCreate', async (interaction) => {
     // ----- buttons -----
     if (interaction.isButton()) {
       const [action, idStr] = interaction.customId.split(':');
-      if (action !== 'claim' && action !== 'unclaim') return;
+      if (action !== 'claim' && action !== 'unclaim' && action !== 'close') return;
       const s = db.scrims[idStr];
-      if (!s || s.cancelled) {
+      if (!s) {
         return interaction.reply({ content: 'This scrim is no longer available.', flags: EPHEMERAL });
       }
       const uid = interaction.user.id;
+      const gid = s.guildId || interaction.guildId;
+
+      // ----- Close Scrim (the button inside the thread) -----
+      if (action === 'close') {
+        if (isClosed(s)) return interaction.reply({ content: 'This scrim is already closed.', flags: EPHEMERAL });
+        if (uid !== s.authorId && !s.casters.includes(uid) && !isMod(interaction)) {
+          return interaction.reply({ content: 'Only the poster, the caster or a moderator can close this scrim.', flags: EPHEMERAL });
+        }
+        s.closed = true;
+        s.closedBy = uid;
+        save();
+        await interaction.update({ components: [buildCloseRow(s, true)] }); // greys out the button right away
+        await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
+        const t = await getThread(s);
+        if (t) {
+          await t.send({ content: `<@${uid}> closed this scrim. This thread is now locked.`, allowedMentions: { parse: [] } }).catch(() => {});
+          await t.setLocked(true).catch(() => {});
+          await t.setArchived(true).catch(() => {});
+        }
+        await logEvent(gid, `Scrim #${s.id} closed`, `**${s.team1} vs ${s.team2}** was closed by <@${uid}>.`, 0xed4245);
+        return;
+      }
+
+      if (isClosed(s)) {
+        return interaction.reply({ content: 'This scrim is no longer available.', flags: EPHEMERAL });
+      }
 
       if (action === 'claim') {
         // Only members with the configured caster role may claim
@@ -942,6 +1006,7 @@ client.on('interactionCreate', async (interaction) => {
         s.cocasters = (s.cocasters || []).filter((id) => id !== uid);
         save();
         await refreshMessage(interaction, s);
+        logEvent(gid, `Scrim #${s.id} claimed`, `<@${uid}> claimed **${s.team1} vs ${s.team2}**.`, 0x57f287);
 
         if (s.threadId) {
           const ok = await addToThread(s, uid, `<@${uid}> claimed this scrim.`);
@@ -964,6 +1029,7 @@ client.on('interactionCreate', async (interaction) => {
       s.casters = s.casters.filter((id) => id !== uid);
       save();
       await refreshMessage(interaction, s);
+      logEvent(gid, `Scrim #${s.id} unclaimed`, `<@${uid}> gave up **${s.team1} vs ${s.team2}**. It is open for casters again.`, 0xfee75c);
       // the poster stays in the thread even if they unclaim
       if (s.threadId && uid !== s.authorId) {
         await removeFromThread(s, uid, `<@${uid}> unclaimed this scrim and left the thread.`);
