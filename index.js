@@ -3,6 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const { execFile } = require('child_process');
+const os = require('os');
+
+const CODE_VERSION = 'panel-form-5'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -188,6 +191,12 @@ const commands = [
     .setDescription('Bot owner only: manage the bot itself')
     .addSubcommand((c) => c.setName('status').setDescription('Show uptime, memory and scrim counts'))
     .addSubcommand((c) => c.setName('logs').setDescription('Show the most recent log lines'))
+    .addSubcommand((c) =>
+      c
+        .setName('update')
+        .setDescription('Download the latest code from GitHub (git pull)')
+        .addBooleanOption((o) => o.setName('restart').setDescription('Restart afterwards so the new code runs (needs pm2)'))
+    )
     .addSubcommand((c) => c.setName('restart').setDescription('Restart the bot (needs pm2 to come back by itself)'))
     .addSubcommand((c) => c.setName('shutdown').setDescription('Turn the bot off (under pm2 it stays off until you start it again)'))
     .toJSON(),
@@ -233,13 +242,32 @@ const commands = [
     .toJSON(),
 ];
 
+let liveCommandsNote = 'not checked yet'; // what Discord says it has registered, shown in /admin status
+
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  const route = GUILD_ID
-    ? Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID)
-    : Routes.applicationCommands(CLIENT_ID);
-  await rest.put(route, { body: commands });
-  console.log('Slash commands registered');
+  if (GUILD_ID) {
+    // Server commands show up instantly. Do this first: if the ID is wrong it throws before anything is removed.
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    // Remove older global copies of the commands so each one isn't listed twice
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: [] }).catch((e) => console.error('Could not clear global commands:', e.message));
+    console.log('Slash commands registered (for your server, instant)');
+  } else {
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log('Slash commands registered');
+  }
+
+  // Ask Discord what it actually has now, so we can tell a registration problem from a Discord-app display problem
+  try {
+    const live = await rest.get(GUILD_ID ? Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID) : Routes.applicationCommands(CLIENT_ID));
+    const setup = live.find((c) => c.name === 'setup');
+    const set = setup && (setup.options || []).find((o) => o.name === 'set');
+    const names = set ? (set.options || []).map((o) => o.name).join(', ') : 'no /setup command found';
+    liveCommandsNote = `${GUILD_ID ? 'server' : 'global'} commands: ${live.map((c) => c.name).join(', ') || 'none'} | /setup set options: ${names}`;
+  } catch (e) {
+    liveCommandsNote = `could not check (${e.message})`;
+  }
+  console.log('Discord now has ->', liveCommandsNote);
 }
 
 // ---------- bot ----------
@@ -522,6 +550,19 @@ async function isBotOwner(userId) {
   }
 }
 
+// Run a command in the bot's folder and wait for it. `shell` is needed for npm on Windows.
+const runCmd = (cmd, args, timeoutMs = 120000, shell = false) =>
+  new Promise((resolve, reject) => {
+    execFile(cmd, args, { cwd: __dirname, timeout: timeoutMs, maxBuffer: 5 * 1024 * 1024, shell }, (err, stdout, stderr) => {
+      if (err) {
+        err.stdout = String(stdout || '');
+        err.stderr = String(stderr || '');
+        return reject(err);
+      }
+      resolve({ stdout: String(stdout || '').trim(), stderr: String(stderr || '').trim() });
+    });
+  });
+
 const underPm2 = () => process.env.pm_id !== undefined && process.env.pm_id !== '';
 const fmtUptime = (sec) => {
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
@@ -542,6 +583,9 @@ async function handleAdmin(interaction) {
     return interaction.editReply({
       content:
         '**Bot status**\n' +
+        `Running on: ${os.hostname()} (${process.platform})\n` +
+        `Code version: ${CODE_VERSION}\n` +
+        `Commands on Discord: ${liveCommandsNote}\n` +
         `Uptime: ${fmtUptime(process.uptime())}\n` +
         `Discord ping: ${Math.round(client.ws.ping)} ms\n` +
         `Memory: ${mb(process.memoryUsage().rss)} MB\n` +
@@ -556,6 +600,52 @@ async function handleAdmin(interaction) {
     let text = recentLogs.slice(-15).join('\n') || '(no logs yet)';
     if (text.length > 1800) text = '...' + text.slice(-1800);
     return interaction.editReply({ content: '```\n' + text.replace(/```/g, "'''") + '\n```' });
+  }
+
+  if (sub === 'update') {
+    const wantRestart = interaction.options.getBoolean('restart') === true;
+    try {
+      const before = (await runCmd('git', ['rev-parse', 'HEAD'])).stdout;
+      await runCmd('git', ['pull', '--ff-only']);
+      const after = (await runCmd('git', ['rev-parse', 'HEAD'])).stdout;
+      if (before === after) return interaction.editReply({ content: 'Already up to date. Nothing to download.' });
+
+      const changed = (await runCmd('git', ['diff', '--name-only', before, after])).stdout.split('\n').filter(Boolean);
+      const commits = (await runCmd('git', ['log', '--oneline', '-5', `${before}..${after}`])).stdout;
+      let npmNote = '';
+      if (changed.some((f) => f === 'package.json' || f === 'package-lock.json')) {
+        await runCmd(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--no-audit', '--no-fund'], 300000, process.platform === 'win32');
+        npmNote = '\nDependencies were reinstalled (`npm install`).';
+      }
+
+      let text =
+        `Updated \`${before.slice(0, 7)}\` to \`${after.slice(0, 7)}\`.\n` +
+        `Changed files (${changed.length}): ${changed.slice(0, 10).join(', ')}${changed.length > 10 ? ', ...' : ''}\n` +
+        (commits ? '```\n' + commits.slice(0, 600) + '\n```' : '') +
+        npmNote;
+
+      if (wantRestart && underPm2()) {
+        await interaction.editReply({ content: text + '\nRestarting now to run the new code. Back in a few seconds.' });
+        setTimeout(() => {
+          client.destroy();
+          process.exit(0); // pm2 starts it again with the new code
+        }, 500);
+        return;
+      }
+      text += wantRestart
+        ? "\nI'm not running under pm2, so I can't restart myself. Restart me by hand to use the new code."
+        : '\nRun `/admin restart` (or `/admin update restart:True` next time) to start using the new code.';
+      return interaction.editReply({ content: text.slice(0, 1900) });
+    } catch (e) {
+      const detail = `${e.stderr || ''} ${e.message || ''}`.trim();
+      let msg;
+      if (e.code === 'ENOENT') msg = 'Git is not installed on this machine, so I can\'t update myself.';
+      else if (/not a git repository/i.test(detail)) msg = "This copy of the bot isn't a git checkout (it wasn't cloned from GitHub), so it can't update itself. Copy the new files over by hand.";
+      else if (e.killed) msg = 'The update took too long and was stopped.';
+      else msg = 'The update failed:\n```\n' + detail.replace(/```/g, "'''").slice(0, 1200) + '\n```';
+      console.error('Update failed:', shortErr(e));
+      return interaction.editReply({ content: msg });
+    }
   }
 
   if (sub === 'restart') {
