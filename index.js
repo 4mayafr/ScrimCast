@@ -5,7 +5,7 @@ const http = require('http');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-7'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-8'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -86,6 +86,11 @@ const EPHEMERAL = MessageFlags.Ephemeral;
 const MAX_CASTERS = 1; // casters per scrim
 const MAX_COCASTERS = 4; // co-casters per scrim
 const PING_COOLDOWN_MS = 10000;
+const REMIND_MINUTES = [30, 5]; // reminders in the thread before a scrim starts
+const UNCLAIMED_ALERT_MINUTES = [60, 15]; // caster role is re-pinged if nobody has claimed by then
+const AUTO_CLOSE_AFTER_MS = (Number(process.env.AUTO_CLOSE_HOURS) || 4) * 3600000; // closed this long after the start time
+const AUTO_CLOSE_NO_TIME_MS = 48 * 3600000; // scrims whose time couldn't be read are closed this long after posting
+const SCHEDULER_EVERY_MS = Number(process.env.SCHEDULER_EVERY_MS) || 30000;
 const SERVER_LOG_EVERY_MS = Number(process.env.SERVER_LOG_EVERY_MS) || 60000; // how often the live server log is refreshed
 
 // ---------- tiny JSON storage ----------
@@ -124,6 +129,68 @@ async function logEvent(guildId, title, description, color = 0x5865f2) {
   }
 }
 
+// ---------- scrim times ----------
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+function validTimezone(tz) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+const tzParts = (ms, tz) => {
+  const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }).formatToParts(new Date(ms));
+  const g = (t) => Number(p.find((x) => x.type === t).value);
+  return { y: g('year'), mo: g('month'), d: g('day'), h: g('hour'), mi: g('minute'), s: g('second') };
+};
+const tzOffsetMs = (ms, tz) => {
+  const q = tzParts(ms, tz);
+  return Date.UTC(q.y, q.mo - 1, q.d, q.h, q.mi, q.s) - Math.floor(ms / 1000) * 1000;
+};
+// Wall-clock time in a timezone -> UTC milliseconds (null if the date doesn't exist)
+function zonedToUtc(y, mo, d, h, mi, tz) {
+  if (mo < 1 || mo > 12 || h > 23 || mi > 59 || new Date(Date.UTC(y, mo - 1, d)).getUTCDate() !== d) return null;
+  const guess = Date.UTC(y, mo - 1, d, h, mi);
+  const first = guess - tzOffsetMs(guess, tz);
+  return guess - tzOffsetMs(first, tz);
+}
+// Reads the "When" text. Understands: 2026-10-25 19:00, today/tomorrow 7pm, 25 Oct 7pm, Oct 25 19:30 (with optional
+// weekday/year), a Discord timestamp like <t:1761390000:F>, or a unix timestamp. Returns UTC ms, or null if unreadable.
+function parseWhen(text, tz, now = Date.now()) {
+  let m = text.match(/<t:(\d{9,11})(?::[a-zA-Z])?>/) || text.trim().match(/^(\d{10})$/);
+  if (m) return Number(m[1]) * 1000;
+  let rest = text.toLowerCase();
+  const today = tzParts(now, tz);
+  let y, mo, d;
+  if ((m = rest.match(/(\d{4})-(\d{1,2})-(\d{1,2})/))) [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  else if ((m = rest.match(/\b(today|tomorrow)\b/))) {
+    const base = new Date(Date.UTC(today.y, today.mo - 1, today.d + (m[1] === 'tomorrow' ? 1 : 0)));
+    [y, mo, d] = [base.getUTCFullYear(), base.getUTCMonth() + 1, base.getUTCDate()];
+  } else if ((m = rest.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?(?:,?\s+(\d{4}))?/))) {
+    [d, mo, y] = [Number(m[1]), MONTHS.indexOf(m[2]) + 1, m[3] ? Number(m[3]) : undefined];
+  } else if ((m = rest.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?/))) {
+    [mo, d, y] = [MONTHS.indexOf(m[1]) + 1, Number(m[2]), m[3] ? Number(m[3]) : undefined];
+  } else return null;
+  rest = rest.replace(m[0], ' ');
+  let h, mi = 0;
+  const t = rest.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/) || rest.match(/(\d{1,2}):(\d{2})()/);
+  if (!t) return null;
+  h = Number(t[1]);
+  mi = t[2] ? Number(t[2]) : 0;
+  if (t[3]) {
+    if (h < 1 || h > 12) return null;
+    h = (h % 12) + (t[3] === 'pm' ? 12 : 0);
+  }
+  if (y === undefined) {
+    y = today.y;
+    const cand = zonedToUtc(y, mo, d, h, mi, tz);
+    if (cand !== null && cand < now - 86400000) y += 1; // "25 Oct" said in November means next year
+  }
+  return zonedToUtc(y, mo, d, h, mi, tz);
+}
+const whenText = (s) => (s.startsAt ? `<t:${Math.floor(s.startsAt / 1000)}:F> (<t:${Math.floor(s.startsAt / 1000)}:R>)` : s.time);
+
 // ---------- UI helpers ----------
 function buildEmbed(s) {
   const cocasters = s.cocasters || [];
@@ -132,7 +199,7 @@ function buildEmbed(s) {
     .setTitle(`${s.team1} vs ${s.team2}`)
     .setColor(isClosed(s) ? 0x808080 : open ? 0x57f287 : 0xed4245)
     .addFields(
-      { name: 'When', value: s.time, inline: true },
+      { name: 'When', value: whenText(s), inline: true },
       { name: 'Posted by', value: `<@${s.authorId}>`, inline: true },
       {
         name: `Caster (${s.casters.length}/${MAX_CASTERS})`,
@@ -225,6 +292,9 @@ const commands = [
             .setDescription('Optional: private channel for a live bot/server log that updates every minute')
             .addChannelTypes(ChannelType.GuildText)
         )
+        .addStringOption((o) =>
+          o.setName('timezone').setDescription('Optional: timezone used to read scrim times, e.g. Australia/Melbourne or America/New_York (default UTC)')
+        )
     )
     .addSubcommand((c) => c.setName('serverlogs_off').setDescription('Turn the live server log off'))
     .addSubcommand((c) => c.setName('view').setDescription('Show the current setup'))
@@ -244,6 +314,18 @@ const commands = [
     )
     .addSubcommand((c) => c.setName('restart').setDescription('Restart the bot (needs pm2 to come back by itself)'))
     .addSubcommand((c) => c.setName('shutdown').setDescription('Turn the bot off (under pm2 it stays off until you start it again)'))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('stats')
+    .setDescription('Caster stats')
+    .addSubcommand((c) =>
+      c
+        .setName('user')
+        .setDescription("Show someone's casting stats (default: yours)")
+        .addUserOption((o) => o.setName('user').setDescription('Who to look up'))
+    )
+    .addSubcommand((c) => c.setName('leaderboard').setDescription('Top casters in this server'))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -325,6 +407,8 @@ async function onReady() {
   // Keep the live server log fresh (one message per server, edited every minute)
   updateServerLogs();
   setInterval(updateServerLogs, SERVER_LOG_EVERY_MS).unref();
+  runScheduler();
+  setInterval(runScheduler, SCHEDULER_EVERY_MS).unref();
   try {
     await registerCommands();
   } catch (e) {
@@ -464,7 +548,7 @@ function buildScrimModal() {
     .addComponents(
       textRow('team1', 'Team 1', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Red Dragons' }),
       textRow('team2', 'Team 2', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Blue Wolves' }),
-      textRow('time', 'When', TextInputStyle.Short, { max: 100, placeholder: 'e.g. Sat 25 Oct, 7pm AEDT' }),
+      textRow('time', 'When', TextInputStyle.Short, { max: 100, placeholder: 'e.g. 2026-10-25 19:00  or  25 Oct 7pm  or  tomorrow 8pm' }),
       textRow('notes', 'Notes (optional)', TextInputStyle.Paragraph, {
         required: false,
         max: 500,
@@ -514,6 +598,9 @@ async function createScrim(interaction, { team1, team2, time, notes }) {
     team1,
     team2,
     time,
+    startsAt: null,
+    createdAt: Date.now(),
+    sent: {},
     notes,
     authorId: interaction.user.id,
     casters: [],
@@ -524,6 +611,22 @@ async function createScrim(interaction, { team1, team2, time, notes }) {
     threadId: null,
     threadParentId: threadChannel.id,
   };
+
+  // Work out when it starts (in the server's timezone) so reminders and auto-close can run
+  const tz = cfg.timezone || 'UTC';
+  let timeNote = '';
+  const parsed = parseWhen(time, tz);
+  if (parsed !== null && parsed > Date.now()) {
+    s.startsAt = parsed;
+    for (const m of REMIND_MINUTES) if (Date.now() >= parsed - m * 60000) s.sent['rem' + m] = true; // no reminders for moments already passed
+    for (const m of UNCLAIMED_ALERT_MINUTES) if (Date.now() >= parsed - m * 60000) s.sent['unc' + m] = true;
+    timeNote = `\nStart time read as <t:${Math.floor(parsed / 1000)}:F> (server timezone ${tz}). If that's wrong, close the scrim and post it again.`;
+  } else {
+    timeNote =
+      parsed !== null
+        ? '\nThat time is in the past, so there will be no reminders.'
+        : `\nI couldn't read that time, so there will be no reminders. Try a format like \`2026-10-25 19:00\`, \`25 Oct 7pm\` or \`tomorrow 8pm\` (server timezone ${tz}). It will auto-close 48 hours after posting.`;
+  }
 
   // 1) create the private thread
   let thread;
@@ -565,7 +668,7 @@ async function createScrim(interaction, { team1, team2, time, notes }) {
   await thread
     .send({
       content:
-        `**Scrim #${s.id}: ${s.team1} vs ${s.team2}** (${s.time})\n` +
+        `**Scrim #${s.id}: ${s.team1} vs ${s.team2}** (${whenText(s)})\n` +
         `Posted by <@${s.authorId}>. The caster who claims this scrim is added here automatically.\n` +
         `The caster can add up to ${MAX_COCASTERS} co-casters with \`/scrim addcocaster\`, and ping everyone here with \`/scrim ping\`.\n` +
         'Press **Close Scrim** below when the scrim is over.',
@@ -576,11 +679,11 @@ async function createScrim(interaction, { team1, team2, time, notes }) {
   await logEvent(
     s.guildId,
     `Scrim #${s.id} posted`,
-    `**${s.team1} vs ${s.team2}** at ${s.time}\nPosted by <@${s.authorId}> in <#${s.channelId}>. Thread: <#${s.threadId}>`,
+    `**${s.team1} vs ${s.team2}** at ${whenText(s)}\nPosted by <@${s.authorId}> in <#${s.channelId}>. Thread: <#${s.threadId}>`,
     0x5865f2
   );
 
-  return interaction.editReply({ content: `Scrim #${s.id} posted in <#${s.channelId}>. Thread: <#${thread.id}>` });
+  return interaction.editReply({ content: `Scrim #${s.id} posted in <#${s.channelId}>. Thread: <#${thread.id}>${timeNote}` });
 }
 
 const pingCooldown = new Map();
@@ -618,6 +721,112 @@ const fmtUptime = (sec) => {
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
   return `${d ? d + 'd ' : ''}${h}h ${m}m`;
 };
+
+// ---------- closing, reminders and auto-close ----------
+// byId is the user who closed it, or 'auto'. `ack` runs right after the scrim is marked closed (used to answer the button press).
+async function closeScrim(s, byId, ack) {
+  s.closed = true;
+  s.closedBy = byId;
+  s.closedAt = Date.now();
+  save();
+  if (ack) await ack();
+  await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
+  const t = await getThread(s);
+  if (t) {
+    const who = byId === 'auto' ? 'This scrim was closed automatically.' : `<@${byId}> closed this scrim.`;
+    await t.send({ content: `${who} This thread is now locked.`, allowedMentions: { parse: [] } }).catch(() => {});
+    await t.setLocked(true).catch(() => {});
+    await t.setArchived(true).catch(() => {});
+  }
+  const how = byId === 'auto' ? 'was closed automatically' : `was closed by <@${byId}>`;
+  await logEvent(s.guildId, `Scrim #${s.id} closed`, `**${s.team1} vs ${s.team2}** ${how}.`, 0xed4245);
+}
+
+// Which threshold (in minutes) just came due, if any. All passed thresholds are marked so a late bot doesn't send a pile of old alerts.
+function dueThreshold(s, prefix, mins, now) {
+  const passed = mins.filter((m) => now >= s.startsAt - m * 60000);
+  if (!passed.length) return null;
+  const newest = Math.min(...passed);
+  const fresh = !s.sent[prefix + newest];
+  passed.forEach((m) => (s.sent[prefix + m] = true));
+  return fresh ? newest : null;
+}
+
+async function schedulerStep(s, now) {
+  if (!s.createdAt) {
+    s.createdAt = now; // scrims from older versions get a fresh 48 hours
+    save();
+  }
+  const closeAt = s.startsAt ? s.startsAt + AUTO_CLOSE_AFTER_MS : s.createdAt + AUTO_CLOSE_NO_TIME_MS;
+  if (now >= closeAt) return closeScrim(s, 'auto');
+  if (!s.startsAt || now >= s.startsAt) return;
+  s.sent = s.sent || {};
+  const cfg = getConfig(s.guildId);
+
+  if (!s.casters.length) {
+    const min = dueThreshold(s, 'unc', UNCLAIMED_ALERT_MINUTES, now);
+    if (min !== null) {
+      save();
+      const ch = cfg && cfg.casterRoleId ? await client.channels.fetch(s.channelId).catch(() => null) : null;
+      if (ch) {
+        await ch
+          .send({
+            content: `<@&${cfg.casterRoleId}> Scrim #${s.id} (**${s.team1} vs ${s.team2}**) starts <t:${Math.floor(s.startsAt / 1000)}:R> and still needs a caster! https://discord.com/channels/${s.guildId}/${s.channelId}/${s.messageId}`,
+            allowedMentions: { roles: [cfg.casterRoleId] },
+          })
+          .catch((e) => console.error('Could not send unclaimed alert:', e.message));
+      }
+    }
+  }
+
+  const min = dueThreshold(s, 'rem', REMIND_MINUTES, now);
+  if (min !== null) {
+    save();
+    const t = await getThread(s);
+    if (t) {
+      const people = [...new Set([s.authorId, ...s.casters, ...(s.cocasters || [])])];
+      await t
+        .send({
+          content: `${people.map((id) => `<@${id}>`).join(' ')} Scrim #${s.id} starts <t:${Math.floor(s.startsAt / 1000)}:R>.`,
+          allowedMentions: { users: people },
+        })
+        .catch((e) => console.error('Could not send reminder:', e.message));
+    }
+  }
+}
+
+let schedulerBusy = false;
+async function runScheduler() {
+  if (schedulerBusy) return;
+  schedulerBusy = true;
+  try {
+    const now = Date.now();
+    for (const s of Object.values(db.scrims)) {
+      if (isClosed(s)) continue;
+      try {
+        await schedulerStep(s, now);
+      } catch (e) {
+        console.error(`Scheduler problem with scrim #${s.id}:`, e.message);
+      }
+    }
+  } finally {
+    schedulerBusy = false;
+  }
+}
+
+// ---------- stats ----------
+function collectStats(guildId) {
+  const users = {};
+  const u = (id) => (users[id] = users[id] || { cast: 0, cocast: 0, posted: 0 });
+  for (const s of Object.values(db.scrims)) {
+    if (s.guildId !== guildId) continue;
+    u(s.authorId).posted += 1;
+    if (!isClosed(s) || !s.casters.length) continue; // only finished scrims that had a caster count
+    s.casters.forEach((id) => (u(id).cast += 1));
+    (s.cocasters || []).forEach((id) => (u(id).cocast += 1));
+  }
+  return users;
+}
 
 // ---------- live server log (one message, edited every minute) ----------
 function buildServerLogEmbed() {
@@ -829,6 +1038,7 @@ client.on('interactionCreate', async (interaction) => {
               `**Post Scrim panel:** ${c.panelChannelId ? `<#${c.panelChannelId}>` : 'not set, run `/setup set` again'}\n` +
               `**Scrims are posted in:** <#${c.postChannelId}>\n` +
               `**Log channel:** ${c.logChannelId ? `<#${c.logChannelId}>` : 'not set, run `/setup set` again'}\n` +
+              `**Timezone:** ${c.timezone || 'UTC (change it with the timezone option of `/setup set`)'}\n` +
               `**Live server log:** ${c.serverLogChannelId ? `<#${c.serverLogChannelId}> (updates every minute)` : 'off'}\n` +
               `**Private threads are created in:** <#${c.threadChannelId}>\n` +
               `**Role that can claim:** <@&${c.casterRoleId}>`,
@@ -870,6 +1080,10 @@ client.on('interactionCreate', async (interaction) => {
         const threads = interaction.options.getChannel('thread_channel', true);
         const role = interaction.options.getRole('caster_role', true);
         const serverLog = interaction.options.getChannel('server_log_channel'); // optional
+        const tzInput = interaction.options.getString ? interaction.options.getString('timezone') : null; // optional
+        if (tzInput && !validTimezone(tzInput.trim())) {
+          return interaction.editReply({ content: `"${tzInput}" isn't a timezone I know. Use a name like \`Australia/Melbourne\`, \`Europe/London\` or \`America/New_York\`. Nothing was changed.` });
+        }
         const previous = getConfig(interaction.guildId);
         // Leaving server_log_channel out keeps whatever was set before; picking a different channel moves the live message
         const keepServerLog = !serverLog || (previous && previous.serverLogChannelId === serverLog.id);
@@ -883,6 +1097,7 @@ client.on('interactionCreate', async (interaction) => {
           panelMessage: previous ? previous.panelMessage : undefined, // so the old panel can be replaced
           serverLogChannelId: serverLog ? serverLog.id : previous ? previous.serverLogChannelId : undefined,
           serverLogMessage: keepServerLog && previous ? previous.serverLogMessage : undefined,
+          timezone: tzInput ? tzInput.trim() : previous ? previous.timezone : undefined,
         };
         save();
 
@@ -920,6 +1135,7 @@ client.on('interactionCreate', async (interaction) => {
             `**Post Scrim panel:** <#${panel.id}>${panelResult.ok ? ' (posted)' : ''}\n` +
             `**Scrims are posted in:** <#${post.id}>\n` +
             `**Log channel:** <#${logCh.id}>\n` +
+            `**Timezone:** ${db.config[interaction.guildId].timezone || 'UTC (add the optional timezone option so scrim times are read correctly)'}\n` +
             `**Live server log:** ${serverLogId ? `<#${serverLogId}> (updates every minute)` : 'off (add the optional server_log_channel to turn it on)'}\n` +
             `**Private threads are created in:** <#${threads.id}>\n` +
             `**Role that can claim:** <@&${role.id}>\n\n` +
@@ -929,6 +1145,38 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       // ===== /scrim ... =====
+      if (interaction.commandName === 'stats') {
+        const users = collectStats(interaction.guildId);
+        const none = { cast: 0, cocast: 0, posted: 0 };
+        if (interaction.options.getSubcommand() === 'leaderboard') {
+          const top = Object.entries(users)
+            .filter(([, v]) => v.cast + v.cocast > 0)
+            .sort((a, b) => b[1].cast - a[1].cast || b[1].cocast - a[1].cocast)
+            .slice(0, 10);
+          const text = top.length
+            ? top.map(([id, v], i) => `**${i + 1}.** <@${id}>: ${v.cast} cast, ${v.cocast} co-cast`).join('\n')
+            : 'No finished scrims with a caster yet.';
+          return interaction.reply({ embeds: [new EmbedBuilder().setTitle('Top casters').setColor(0x5865f2).setDescription(text).setFooter({ text: 'Counts closed scrims that had a caster' })], allowedMentions: { parse: [] } });
+        }
+        const target = interaction.options.getUser('user') || interaction.user;
+        const v = users[target.id] || none;
+        return interaction.reply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle('Scrim stats')
+              .setColor(0x5865f2)
+              .setDescription(`<@${target.id}>`)
+              .addFields(
+                { name: 'Scrims cast', value: String(v.cast), inline: true },
+                { name: 'Co-cast', value: String(v.cocast), inline: true },
+                { name: 'Scrims posted', value: String(v.posted), inline: true }
+              )
+              .setFooter({ text: 'Counts closed scrims that had a caster' }),
+          ],
+          allowedMentions: { parse: [] },
+        });
+      }
+
       if (interaction.commandName === 'scrim') {
         const sub = interaction.options.getSubcommand();
 
@@ -1077,18 +1325,7 @@ client.on('interactionCreate', async (interaction) => {
         if (uid !== s.authorId && !s.casters.includes(uid) && !isMod(interaction)) {
           return interaction.reply({ content: 'Only the poster, the caster or a moderator can close this scrim.', flags: EPHEMERAL });
         }
-        s.closed = true;
-        s.closedBy = uid;
-        save();
-        await interaction.update({ components: [buildCloseRow(s, true)] }); // greys out the button right away
-        await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
-        const t = await getThread(s);
-        if (t) {
-          await t.send({ content: `<@${uid}> closed this scrim. This thread is now locked.`, allowedMentions: { parse: [] } }).catch(() => {});
-          await t.setLocked(true).catch(() => {});
-          await t.setArchived(true).catch(() => {});
-        }
-        await logEvent(gid, `Scrim #${s.id} closed`, `**${s.team1} vs ${s.team2}** was closed by <@${uid}>.`, 0xed4245);
+        await closeScrim(s, uid, () => interaction.update({ components: [buildCloseRow(s, true)] })); // greys out the button right away
         return;
       }
 
