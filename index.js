@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-14'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-15'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -249,6 +249,11 @@ function buildButtons(s) {
       .setLabel(full ? 'Claimed' : 'Claim as Caster')
       .setStyle(ButtonStyle.Success)
       .setDisabled(full || isClosed(s)),
+    new ButtonBuilder()
+      .setCustomId(`cocast:${s.id}`)
+      .setLabel('Claim as Co-caster')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled((s.cocasters || []).length >= MAX_COCASTERS || isClosed(s)),
     new ButtonBuilder()
       .setCustomId(`unclaim:${s.id}`)
       .setLabel('Unclaim')
@@ -1732,7 +1737,7 @@ client.on('interactionCreate', async (interaction) => {
     // ----- buttons -----
     if (interaction.isButton()) {
       const [action, idStr] = interaction.customId.split(':');
-      if (action !== 'claim' && action !== 'unclaim' && action !== 'close' && action !== 'edit') return;
+      if (action !== 'claim' && action !== 'unclaim' && action !== 'close' && action !== 'edit' && action !== 'cocast') return;
       const s = db.scrims[idStr];
       if (!s) {
         return interaction.reply({ content: 'This scrim is no longer available.', flags: EPHEMERAL });
@@ -1797,7 +1802,48 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // unclaim
+      if (action === 'cocast') {
+        const cfg = getConfig(s.guildId || interaction.guildId);
+        if (!cfg || !cfg.casterRoleId) {
+          return interaction.reply({ content: 'This server is not set up yet. The server owner needs to run `/setup set`.', flags: EPHEMERAL });
+        }
+        if (!interaction.member?.roles?.cache?.has(cfg.casterRoleId)) {
+          return interaction.reply({ content: `You need the <@&${cfg.casterRoleId}> role to join scrims as a co-caster.`, flags: EPHEMERAL });
+        }
+        s.cocasters = s.cocasters || [];
+        if (s.casters.includes(uid)) return interaction.reply({ content: "You're already the caster on this scrim.", flags: EPHEMERAL });
+        if (uid === s.authorId) return interaction.reply({ content: "You posted this scrim, so you're already in its thread.", flags: EPHEMERAL });
+        if (s.cocasters.includes(uid)) return interaction.reply({ content: "You're already a co-caster on this scrim.", flags: EPHEMERAL });
+        if (s.cocasters.length >= MAX_COCASTERS) {
+          return interaction.reply({ content: `This scrim already has ${MAX_COCASTERS} co-casters, which is the maximum.`, flags: EPHEMERAL });
+        }
+        s.cocasters.push(uid);
+        save();
+        await refreshMessage(interaction, s);
+        logEvent(gid, `Scrim #${s.id} co-caster joined`, `<@${uid}> joined **${s.team1} vs ${s.team2}** as a co-caster.`, 0x5865f2);
+        if (s.threadId) {
+          const ok = await addToThread(s, uid, `<@${uid}> joined as a co-caster.`);
+          interaction
+            .followUp({
+              content: ok
+                ? `You joined Scrim #${s.id} as a co-caster. Thread: <#${s.threadId}>`
+                : `You joined Scrim #${s.id} as a co-caster, but I couldn't add you to the thread. Ask the server owner to check my Manage Threads permission.`,
+              flags: EPHEMERAL,
+            })
+            .catch(() => {});
+        }
+        return;
+      }
+
+      // unclaim (the caster gives the scrim up, or a co-caster leaves)
+      if ((s.cocasters || []).includes(uid) && !s.casters.includes(uid)) {
+        s.cocasters = s.cocasters.filter((id) => id !== uid);
+        save();
+        await refreshMessage(interaction, s);
+        logEvent(gid, `Scrim #${s.id} co-caster left`, `<@${uid}> left **${s.team1} vs ${s.team2}** as a co-caster.`, 0xfee75c);
+        if (s.threadId) await removeFromThread(s, uid, `<@${uid}> left as a co-caster.`);
+        return;
+      }
       if (!s.casters.includes(uid)) {
         return interaction.reply({ content: "You haven't claimed this scrim.", flags: EPHEMERAL });
       }
