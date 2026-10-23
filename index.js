@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-13'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-14'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -290,6 +290,11 @@ const ENV_KEYS = {
   OVERLOAD_MIN_FREE_MEM: { check: num(0.01, 0.9) },
   OVERLOAD_PING_MS: { check: num(100, 60000) },
   OVERLOAD_LAG_MS: { check: num(100, 60000) },
+  // the /aleisha command
+  ALEISHA_MESSAGE: { long: true, max: 1000, check: () => null },
+  ALEISHA_IMAGE: { max: 300, check: (v) => (/^https:\/\/\S+$/.test(v) ? null : 'must be a link starting with https://') },
+  ALEISHA_PRIVATE: { check: (v) => (/^(true|false)$/i.test(v) ? null : 'must be true or false') },
+  ALEISHA_DESCRIPTION: { check: (v) => (v.length <= 100 ? null : 'must be 100 characters or fewer') },
 };
 const ENV_CHOICES = Object.keys(ENV_KEYS).map((k) => ({ name: k, value: k }));
 
@@ -348,10 +353,14 @@ function validateEnvValue(key, raw) {
   const v = String(raw || '').trim();
   if (!spec) return { error: 'That setting can\'t be changed from Discord.' };
   if (!v) return { error: 'The value can\'t be empty. Use `/admin env_unset` to remove a setting.' };
-  if (/["\\\r\n]/.test(v)) return { error: 'The value can\'t contain quotes, backslashes or line breaks.' };
-  if (v.length > 200) return { error: 'The value is too long (200 characters max).' };
+  if ((spec.long ? /["\\]/ : /["\\\r\n]/).test(v)) {
+    return { error: spec.long ? "The value can't contain double quotes or backslashes." : "The value can't contain quotes, backslashes or line breaks." };
+  }
+  const max = spec.max || 200;
+  if (v.length > max) return { error: `The value is too long (${max} characters max).` };
   const problem = spec.check(v);
-  return problem ? { error: `${key} ${problem}.` } : { value: v };
+  // The .env file is one line per setting, so line breaks in long text are stored as a literal \n
+  return problem ? { error: `${key} ${problem}.` } : { value: spec.long ? v.replace(/\r?\n/g, '\\n') : v };
 }
 
 function buildEnvModal(key, restart) {
@@ -360,10 +369,10 @@ function buildEnvModal(key, restart) {
     .setCustomId(`envset:${key}:${restart ? 1 : 0}`)
     .setTitle(`Set ${key}`.slice(0, 45))
     .addComponents(
-      textRow('value', 'New value', TextInputStyle.Short, {
-        max: 200,
+      textRow('value', 'New value', ENV_KEYS[key].long ? TextInputStyle.Paragraph : TextInputStyle.Short, {
+        max: ENV_KEYS[key].max || 200,
         placeholder: ENV_KEYS[key].secret ? 'The new secret (it is not shown again)' : 'The new value',
-        value: ENV_KEYS[key].secret ? undefined : current, // never pre-fill secrets
+        value: ENV_KEYS[key].secret ? undefined : ENV_KEYS[key].long && current ? current.replace(/\\n/g, '\n') : current, // never pre-fill secrets
       })
     );
 }
@@ -489,6 +498,11 @@ const commands = [
     )
     .addSubcommand((c) => c.setName('restart').setDescription('Restart the bot (needs pm2 to come back by itself)'))
     .addSubcommand((c) => c.setName('shutdown').setDescription('Turn the bot off (under pm2 it stays off until you start it again)'))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('aleisha')
+    .setDescription((process.env.ALEISHA_DESCRIPTION || 'Aleisha').trim().slice(0, 100) || 'Aleisha')
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -1120,6 +1134,21 @@ async function runScheduler() {
   }
 }
 
+// ---------- /aleisha (everything about it comes from the .env file) ----------
+// ALEISHA_MESSAGE: the reply (write \n for a new line). ALEISHA_IMAGE: an https image link shown under it.
+// ALEISHA_PRIVATE: true = only the person who used it sees the reply. ALEISHA_DESCRIPTION: the text Discord shows for the command.
+async function handleAleisha(interaction) {
+  const text = (process.env.ALEISHA_MESSAGE || '').replace(/\\n/g, '\n').trim().slice(0, 2000);
+  const image = (process.env.ALEISHA_IMAGE || '').trim();
+  const payload = {
+    content: text || (image ? undefined : "This command isn't customised yet. The bot owner can set `ALEISHA_MESSAGE` with `/admin env_set`."),
+    allowedMentions: { parse: [] },
+  };
+  if (/^https:\/\/\S+$/.test(image)) payload.embeds = [new EmbedBuilder().setImage(image).setColor(0x5865f2)];
+  if (/^true$/i.test((process.env.ALEISHA_PRIVATE || '').trim())) payload.flags = EPHEMERAL;
+  return interaction.reply(payload);
+}
+
 // ---------- stats ----------
 function collectStats(guildId) {
   const users = {};
@@ -1342,6 +1371,7 @@ client.on('interactionCreate', async (interaction) => {
     // ----- slash commands -----
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'admin') return handleAdmin(interaction);
+      if (interaction.commandName === 'aleisha') return handleAleisha(interaction);
 
       if (!interaction.guildId || !interaction.guild) {
         return interaction.reply({ content: 'Use this command in a server.', flags: EPHEMERAL });
