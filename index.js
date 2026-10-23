@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-11'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-13'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -87,6 +87,7 @@ const EPHEMERAL = MessageFlags.Ephemeral;
 const MAX_CASTERS = 1; // casters per scrim
 const MAX_COCASTERS = 4; // co-casters per scrim
 const PING_COOLDOWN_MS = 10000;
+const ENV_FILE = process.env.ENV_FILE || path.join(__dirname, '.env');
 const REMIND_MINUTES = [30, 5]; // reminders in the thread before a scrim starts
 const UNCLAIMED_ALERT_MINUTES = [60, 15]; // caster role is re-pinged if nobody has claimed by then
 const AUTO_CLOSE_AFTER_MS = (Number(process.env.AUTO_CLOSE_HOURS) || 4) * 3600000; // closed this long after the start time
@@ -273,6 +274,131 @@ function buildCloseRow(s, closed = false) {
 }
 
 // ---------- commands ----------
+// ---------- editing .env from Discord (bot owner only) ----------
+// Only these settings can be changed here. DISCORD_TOKEN, CLIENT_ID and BOT_OWNER_ID are left out on purpose: a typo in
+// them could stop the bot logging in or lock you out of /admin, and then there's no way to fix it from Discord.
+const num = (min, max = Infinity, what = 'a number') => (v) => (Number.isFinite(Number(v)) && Number(v) >= min && Number(v) <= max ? null : `must be ${what} from ${min}${max < Infinity ? ' to ' + max : ' up'}`);
+const ENV_KEYS = {
+  STATUS_TEXT: { check: (v) => (v.length <= 128 ? null : 'must be 128 characters or fewer') },
+  GUILD_ID: { check: (v) => (/^\d{17,20}$/.test(v) ? null : 'must be a server ID (17 to 20 digits)') },
+  DASHBOARD_TOKEN: { secret: true, check: (v) => (v.length >= 16 && !/\s/.test(v) ? null : 'must be at least 16 characters with no spaces') },
+  AUTO_CLOSE_HOURS: { check: num(0.1, 720) },
+  SERVER_LOG_EVERY_MS: { check: num(10000, 3600000) },
+  SCHEDULER_EVERY_MS: { check: num(5000, 600000) },
+  MONITOR_EVERY_MS: { check: num(5000, 600000) },
+  OVERLOAD_LOAD_PER_CORE: { check: num(0.1, 100) },
+  OVERLOAD_MIN_FREE_MEM: { check: num(0.01, 0.9) },
+  OVERLOAD_PING_MS: { check: num(100, 60000) },
+  OVERLOAD_LAG_MS: { check: num(100, 60000) },
+};
+const ENV_CHOICES = Object.keys(ENV_KEYS).map((k) => ({ name: k, value: k }));
+
+function readEnvFile() {
+  try {
+    return fs.readFileSync(ENV_FILE, 'utf8');
+  } catch {
+    return '';
+  }
+}
+const ENV_LINE = (key) => new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=(.*)$`);
+// Value of a key as written in the file (null if absent)
+function envFileValue(content, key) {
+  let found = null;
+  for (const line of content.split(/\r?\n/)) {
+    const m = line.match(ENV_LINE(key));
+    if (m) found = m[1].trim().replace(/^(["'])(.*)\1$/, '$2'); // last one wins, like dotenv
+  }
+  return found;
+}
+// Returns the file text with `key` set to `value` (or removed when value is null). Other lines and comments are kept.
+function withEnvValue(content, key, value) {
+  const out = [];
+  let done = false;
+  for (const line of content.split(/\r?\n/)) {
+    if (ENV_LINE(key).test(line)) {
+      if (value !== null && !done) {
+        out.push(`${key}=${formatEnvValue(value)}`);
+        done = true;
+      }
+      continue; // drops the old line, and any duplicates
+    }
+    out.push(line);
+  }
+  if (value !== null && !done) {
+    while (out.length && out[out.length - 1] === '') out.pop();
+    out.push(`${key}=${formatEnvValue(value)}`);
+  }
+  while (out.length && out[out.length - 1] === '') out.pop();
+  return out.join('\n') + '\n';
+}
+const formatEnvValue = (v) => (/[\s#'`$]/.test(v) ? `"${v}"` : v);
+function writeEnvFile(content) {
+  try {
+    if (fs.existsSync(ENV_FILE)) fs.copyFileSync(ENV_FILE, ENV_FILE + '.bak'); // one step back if something goes wrong
+  } catch {
+    /* backup is best effort */
+  }
+  const tmp = ENV_FILE + '.tmp';
+  fs.writeFileSync(tmp, content, { mode: 0o600 });
+  fs.renameSync(tmp, ENV_FILE);
+}
+// Checks what was typed. Returns { value } or { error }.
+function validateEnvValue(key, raw) {
+  const spec = ENV_KEYS[key];
+  const v = String(raw || '').trim();
+  if (!spec) return { error: 'That setting can\'t be changed from Discord.' };
+  if (!v) return { error: 'The value can\'t be empty. Use `/admin env_unset` to remove a setting.' };
+  if (/["\\\r\n]/.test(v)) return { error: 'The value can\'t contain quotes, backslashes or line breaks.' };
+  if (v.length > 200) return { error: 'The value is too long (200 characters max).' };
+  const problem = spec.check(v);
+  return problem ? { error: `${key} ${problem}.` } : { value: v };
+}
+
+function buildEnvModal(key, restart) {
+  const current = envFileValue(readEnvFile(), key);
+  return new ModalBuilder()
+    .setCustomId(`envset:${key}:${restart ? 1 : 0}`)
+    .setTitle(`Set ${key}`.slice(0, 45))
+    .addComponents(
+      textRow('value', 'New value', TextInputStyle.Short, {
+        max: 200,
+        placeholder: ENV_KEYS[key].secret ? 'The new secret (it is not shown again)' : 'The new value',
+        value: ENV_KEYS[key].secret ? undefined : current, // never pre-fill secrets
+      })
+    );
+}
+
+// Tells the owner what to do (or does it) once the file has changed
+async function afterEnvChange(interaction, key, restart) {
+  if (restart && underPm2()) {
+    await interaction.editReply({ content: interaction.__envText + '\nRestarting now so it takes effect. Back in a few seconds.' });
+    exitBot('restart', `<@${interaction.user.id}> changed \`${key}\` and the bot is restarting.`);
+    return;
+  }
+  return interaction.editReply({
+    content: interaction.__envText + (restart ? "\nI'm not running under pm2, so I can't restart by myself. Restart me manually." : '\nIt takes effect after the next restart (`/admin restart`).'),
+  });
+}
+
+async function handleEnvModal(interaction) {
+  if (!(await isBotOwner(interaction.user.id))) {
+    return interaction.reply({ content: 'Only the bot owner can change settings.', flags: EPHEMERAL });
+  }
+  await interaction.deferReply({ flags: EPHEMERAL });
+  const [, key, flag] = interaction.customId.split(':');
+  const r = validateEnvValue(key, interaction.fields.getTextInputValue('value'));
+  if (r.error) return interaction.editReply({ content: r.error + ' Nothing was changed.' });
+  try {
+    writeEnvFile(withEnvValue(readEnvFile(), key, r.value));
+  } catch (e) {
+    console.error('Could not write .env:', e.message);
+    return interaction.editReply({ content: `I couldn't write the .env file: ${e.message}` });
+  }
+  console.log(`[admin] ${key} was changed by ${interaction.user.id}${ENV_KEYS[key].secret ? '' : ' to ' + r.value}`);
+  interaction.__envText = `Saved \`${key}\` = ${ENV_KEYS[key].secret ? '(hidden)' : '`' + r.value + '`'}. The previous file is kept as \`.env.bak\`.`;
+  return afterEnvChange(interaction, key, flag === '1');
+}
+
 const commands = [
   new SlashCommandBuilder()
     .setName('setup')
@@ -345,6 +471,21 @@ const commands = [
         .setName('update')
         .setDescription('Download the latest code from GitHub (git pull)')
         .addBooleanOption((o) => o.setName('restart').setDescription('Restart afterwards so the new code runs (needs pm2)'))
+    )
+    .addSubcommand((c) => c.setName('env_view').setDescription('Show the settings in the .env file (secrets are hidden)'))
+    .addSubcommand((c) =>
+      c
+        .setName('env_set')
+        .setDescription('Change a setting in the .env file (a form opens for the value)')
+        .addStringOption((o) => o.setName('key').setDescription('Which setting').setRequired(true).addChoices(...ENV_CHOICES))
+        .addBooleanOption((o) => o.setName('restart').setDescription('Restart afterwards so it takes effect (needs pm2)'))
+    )
+    .addSubcommand((c) =>
+      c
+        .setName('env_unset')
+        .setDescription('Remove a setting from the .env file (the default is used again)')
+        .addStringOption((o) => o.setName('key').setDescription('Which setting').setRequired(true).addChoices(...ENV_CHOICES))
+        .addBooleanOption((o) => o.setName('restart').setDescription('Restart afterwards so it takes effect (needs pm2)'))
     )
     .addSubcommand((c) => c.setName('restart').setDescription('Restart the bot (needs pm2 to come back by itself)'))
     .addSubcommand((c) => c.setName('shutdown').setDescription('Turn the bot off (under pm2 it stays off until you start it again)'))
@@ -1067,8 +1208,45 @@ async function handleAdmin(interaction) {
   if (!(await isBotOwner(interaction.user.id))) {
     return interaction.reply({ content: 'Only the bot owner can use `/admin`.', flags: EPHEMERAL });
   }
+  if (interaction.options.getSubcommand() === 'env_set') {
+    const key = interaction.options.getString('key');
+    if (!ENV_KEYS[key]) return interaction.reply({ content: "That setting can't be changed from Discord.", flags: EPHEMERAL });
+    // A form (not a command option), so secrets and values don't show up in the channel
+    return interaction.showModal(buildEnvModal(key, interaction.options.getBoolean('restart') === true));
+  }
   await interaction.deferReply({ flags: EPHEMERAL });
   const sub = interaction.options.getSubcommand();
+
+  if (sub === 'env_view') {
+    const content = readEnvFile();
+    const lines = Object.entries(ENV_KEYS).map(([k, spec]) => {
+      const v = envFileValue(content, k);
+      return `${k}: ${v === null ? '(not set)' : spec.secret ? `set (${v.length} characters)` : v}`;
+    });
+    const has = (k) => (envFileValue(content, k) ? 'set' : 'not set');
+    return interaction.editReply({
+      content:
+        '**.env settings**\n```\n' + lines.join('\n') + '\n```' +
+        `Not editable here: DISCORD_TOKEN (${has('DISCORD_TOKEN')}), CLIENT_ID (${has('CLIENT_ID')}), BOT_OWNER_ID (${has('BOT_OWNER_ID')}). Edit the file on the host for those.\n` +
+        (content ? 'Changes take effect after a restart.' : `No .env file found at \`${ENV_FILE}\`. If you set variables in a hosting dashboard instead, change them there.`),
+    });
+  }
+
+  if (sub === 'env_unset') {
+    const key = interaction.options.getString('key');
+    if (!ENV_KEYS[key]) return interaction.editReply({ content: "That setting can't be changed from Discord." });
+    const content = readEnvFile();
+    if (envFileValue(content, key) === null) return interaction.editReply({ content: `\`${key}\` isn't set in the .env file.` });
+    try {
+      writeEnvFile(withEnvValue(content, key, null));
+    } catch (e) {
+      console.error('Could not write .env:', e.message);
+      return interaction.editReply({ content: `I couldn't write the .env file: ${e.message}` });
+    }
+    console.log(`[admin] ${key} was removed by ${interaction.user.id}`);
+    interaction.__envText = `Removed \`${key}\` from the .env file. The default is used again. The previous file is kept as \`.env.bak\`.`;
+    return afterEnvChange(interaction, key, interaction.options.getBoolean('restart') === true);
+  }
 
   if (sub === 'status') {
     const all = Object.values(db.scrims);
@@ -1159,6 +1337,8 @@ async function handleAdmin(interaction) {
 
 client.on('interactionCreate', async (interaction) => {
   try {
+    if (interaction.isModalSubmit && interaction.isModalSubmit() && interaction.customId.startsWith('envset:')) return handleEnvModal(interaction);
+
     // ----- slash commands -----
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'admin') return handleAdmin(interaction);
@@ -1681,8 +1861,9 @@ h1{font-size:20px;margin:4px 0 14px}h2{font-size:15px;margin:22px 0 8px;color:va
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.stat,.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
 .card{margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.muted{color:var(--muted);font-size:13px}
 .badge{font-size:12px;border:1px solid currentColor;border-radius:99px;padding:1px 8px;white-space:nowrap}.needs{color:var(--bad)}.claimed{color:var(--ok)}.closed{color:var(--muted)}
+form{margin:0}.out{background:none;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:5px 10px;font:inherit;font-size:13px;cursor:pointer}
 pre{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:12px}
-</style></head><body><main><h1>Scrim Bot</h1><div class="muted">Refreshes every 30s · ${esc(new Date().toISOString())}</div>
+</style></head><body><main><div class="row"><h1>Scrim Bot</h1><form method="post" action="/dashboard/logout"><button class="out" type="submit">Sign out</button></form></div><div class="muted">Refreshes every 30s · ${esc(new Date().toISOString())}</div>
 <h2>Health</h2><div class="grid">${health}</div>
 <h2>Open scrims (${open.length})</h2>${open.map(card).join('') || '<div class="muted">None</div>'}
 <h2>Recently closed</h2>${recent.map(card).join('') || '<div class="muted">None</div>'}
@@ -1691,9 +1872,58 @@ pre{background:var(--card);border:1px solid var(--line);border-radius:10px;paddi
 }
 
 const dashFails = new Map(); // ip -> { n, resetAt }
+const dashSessions = new Map(); // session id -> expiry (the password itself is never stored in the browser)
+const DASH_SESSION_MS = 30 * 86400000;
+function newDashSession() {
+  const now = Date.now();
+  for (const [id, exp] of dashSessions) if (exp < now) dashSessions.delete(id);
+  const id = crypto.randomBytes(24).toString('hex');
+  dashSessions.set(id, now + DASH_SESSION_MS);
+  return id;
+}
+const dashSessionId = (req) => {
+  const c = (req.headers.cookie || '').split(';').map((x) => x.trim()).find((x) => x.startsWith('dash='));
+  return c ? c.slice(5) : '';
+};
+const dashSessionOk = (id) => {
+  const exp = id && dashSessions.get(id);
+  if (!exp) return false;
+  if (exp < Date.now()) {
+    dashSessions.delete(id);
+    return false;
+  }
+  return true;
+};
+const readBody = (req) =>
+  new Promise((resolve) => {
+    let b = '';
+    req.on('data', (c) => {
+      b += c;
+      if (b.length > 2048) {
+        resolve(null); // far bigger than any password
+        if (req.destroy) req.destroy();
+      }
+    });
+    req.on('end', () => resolve(b));
+    req.on('error', () => resolve(null));
+  });
+
+function loginPage(error) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scrim Bot Dashboard</title><style>
+:root{--bg:#f6f7f9;--fg:#1c1e21;--card:#fff;--line:#d0d5dd;--muted:#667085;--bad:#b42318;--btn:#3b5bdb}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e8eaed;--card:#1e2126;--line:#2e3239;--muted:#9aa3b0;--bad:#f28b82;--btn:#748ffc}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif;padding:16px}
+form{width:100%;max-width:340px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px}h1{font-size:19px;margin:0 0 4px}p{margin:0 0 14px;color:var(--muted);font-size:14px}
+input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:transparent;color:inherit;font:inherit}button{width:100%;margin-top:12px;padding:11px;border:0;border-radius:8px;background:var(--btn);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+.err{color:var(--bad);font-size:14px;margin-top:10px}</style></head><body>
+<form method="post" action="/dashboard/login"><h1>Scrim Bot</h1><p>Enter the dashboard password.</p>
+<input type="password" name="password" placeholder="Password" autocomplete="current-password" autofocus required>
+<button type="submit">Sign in</button>${error ? `<div class="err">${esc(error)}</div>` : ''}</form></body></html>`;
+}
+
 async function handleHttp(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
-  if (url.pathname !== '/dashboard') {
+  if (url.pathname !== '/dashboard' && !url.pathname.startsWith('/dashboard/')) {
     res.writeHead(200);
     return res.end('Scrim bot is running'); // keeps uptime pingers happy
   }
@@ -1701,33 +1931,48 @@ async function handleHttp(req, res) {
     res.writeHead(404);
     return res.end('The dashboard is off. Set DASHBOARD_TOKEN to turn it on.');
   }
-  const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'" };
+  const headers = {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+  };
   const ip = (req.socket && req.socket.remoteAddress) || '?';
-  const f = dashFails.get(ip);
-  if (f && Date.now() < f.resetAt && f.n >= 10) {
-    res.writeHead(429, headers);
-    return res.end('Too many attempts. Try again in a minute.');
-  }
-  const cookie = (req.headers.cookie || '').split(';').map((x) => x.trim()).find((x) => x.startsWith('dash='));
-  let cookieKey = '';
-  try {
-    cookieKey = cookie ? decodeURIComponent(cookie.slice(5)) : '';
-  } catch {
-    /* bad cookie */
-  }
-  const queryKey = url.searchParams.get('key');
-  const given = queryKey !== null ? queryKey : cookieKey;
-  if (!given || !safeEqual(given, DASHBOARD_TOKEN)) {
-    const cur = f && Date.now() < f.resetAt ? f : { n: 0, resetAt: Date.now() + 60000 };
-    cur.n += 1;
-    dashFails.set(ip, cur);
-    res.writeHead(401, headers);
-    return res.end('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:system-ui;padding:24px">Add <code>?key=YOUR_DASHBOARD_TOKEN</code> to the address.</body>');
-  }
-  if (queryKey !== null) {
-    // remember the key in a cookie and drop it from the address bar
-    res.writeHead(302, { Location: '/dashboard', 'Set-Cookie': `dash=${encodeURIComponent(DASHBOARD_TOKEN)}; Path=/dashboard; HttpOnly; SameSite=Strict; Max-Age=2592000`, 'Cache-Control': 'no-store' });
+
+  if (req.method === 'POST' && url.pathname === '/dashboard/login') {
+    const f = dashFails.get(ip);
+    if (f && Date.now() < f.resetAt && f.n >= 10) {
+      res.writeHead(429, headers);
+      return res.end(loginPage('Too many attempts. Try again in a minute.'));
+    }
+    const body = await readBody(req);
+    const password = body === null ? '' : new URLSearchParams(body).get('password') || '';
+    if (!password || !safeEqual(password, DASHBOARD_TOKEN)) {
+      const cur = f && Date.now() < f.resetAt ? f : { n: 0, resetAt: Date.now() + 60000 };
+      cur.n += 1;
+      dashFails.set(ip, cur);
+      res.writeHead(401, headers);
+      return res.end(loginPage('Wrong password.'));
+    }
+    dashFails.delete(ip);
+    res.writeHead(303, { Location: '/dashboard', 'Set-Cookie': `dash=${newDashSession()}; Path=/dashboard; HttpOnly; SameSite=Strict; Max-Age=2592000`, 'Cache-Control': 'no-store' });
     return res.end();
+  }
+
+  if (req.method === 'POST' && url.pathname === '/dashboard/logout') {
+    dashSessions.delete(dashSessionId(req));
+    res.writeHead(303, { Location: '/dashboard', 'Set-Cookie': 'dash=; Path=/dashboard; HttpOnly; SameSite=Strict; Max-Age=0', 'Cache-Control': 'no-store' });
+    return res.end();
+  }
+
+  if (url.pathname !== '/dashboard') {
+    res.writeHead(404);
+    return res.end('Not found');
+  }
+  if (!dashSessionOk(dashSessionId(req))) {
+    res.writeHead(200, headers);
+    return res.end(loginPage()); // not signed in: show the password form
   }
   res.writeHead(200, headers);
   res.end(await renderDashboard());
