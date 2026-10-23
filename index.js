@@ -2,10 +2,11 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-10'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-11'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -196,6 +197,22 @@ function parseWhen(text, tz, now = Date.now()) {
 }
 const whenText = (s) => (s.startsAt ? `<t:${Math.floor(s.startsAt / 1000)}:F> (<t:${Math.floor(s.startsAt / 1000)}:R>)` : s.time);
 
+// Reads s.time in the server's timezone and sets startsAt plus which reminders are already behind us.
+// Returns a note to show the person who typed the time.
+function applyStartTime(s, tz) {
+  s.startsAt = null;
+  s.sent = {};
+  const parsed = parseWhen(s.time, tz);
+  if (parsed !== null && parsed > Date.now()) {
+    s.startsAt = parsed;
+    for (const m of REMIND_MINUTES) if (Date.now() >= parsed - m * 60000) s.sent['rem' + m] = true; // no reminders for moments already passed
+    for (const m of UNCLAIMED_ALERT_MINUTES) if (Date.now() >= parsed - m * 60000) s.sent['unc' + m] = true;
+    return `\nStart time read as <t:${Math.floor(parsed / 1000)}:F> (server timezone ${tz}). If that's wrong, press **Edit** on the scrim to fix it.`;
+  }
+  if (parsed !== null) return '\nThat time is in the past, so there will be no reminders.';
+  return `\nI couldn't read that time, so there will be no reminders. Try a format like \`2026-10-25 19:00\`, \`25 Oct 7pm\` or \`tomorrow 8pm\` (server timezone ${tz}). It will auto-close 48 hours after posting.`;
+}
+
 // ---------- UI helpers ----------
 function buildEmbed(s) {
   const cocasters = s.cocasters || [];
@@ -234,6 +251,11 @@ function buildButtons(s) {
     new ButtonBuilder()
       .setCustomId(`unclaim:${s.id}`)
       .setLabel('Unclaim')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(isClosed(s)),
+    new ButtonBuilder()
+      .setCustomId(`edit:${s.id}`)
+      .setLabel('Edit')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(isClosed(s))
   );
@@ -544,30 +566,32 @@ function buildPanelButtons() {
   );
 }
 
-function textRow(id, label, style, { required = true, max, placeholder }) {
-  return new ActionRowBuilder().addComponents(
-    new TextInputBuilder()
-      .setCustomId(id)
-      .setLabel(label)
-      .setStyle(style)
-      .setRequired(required)
-      .setMaxLength(max)
-      .setPlaceholder(placeholder)
-  );
+function textRow(id, label, style, { required = true, max, placeholder, value }) {
+  const input = new TextInputBuilder()
+    .setCustomId(id)
+    .setLabel(label)
+    .setStyle(style)
+    .setRequired(required)
+    .setMaxLength(max)
+    .setPlaceholder(placeholder);
+  if (value) input.setValue(String(value).slice(0, max)); // pre-filled text (used by the edit form)
+  return new ActionRowBuilder().addComponents(input);
 }
 
-function buildScrimModal() {
+function buildScrimModal(s) {
+  // With a scrim given, this is the Edit form: same fields, pre-filled
   return new ModalBuilder()
-    .setCustomId('scrimform')
-    .setTitle('Post a scrim')
+    .setCustomId(s ? `scrimedit:${s.id}` : 'scrimform')
+    .setTitle(s ? `Edit scrim #${s.id}` : 'Post a scrim')
     .addComponents(
-      textRow('team1', 'Team 1', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Red Dragons' }),
-      textRow('team2', 'Team 2', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Blue Wolves' }),
-      textRow('time', 'When', TextInputStyle.Short, { max: 100, placeholder: 'e.g. 2026-10-25 19:00  or  25 Oct 7pm  or  tomorrow 8pm' }),
+      textRow('team1', 'Team 1', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Red Dragons', value: s && s.team1 }),
+      textRow('team2', 'Team 2', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Blue Wolves', value: s && s.team2 }),
+      textRow('time', 'When', TextInputStyle.Short, { max: 100, placeholder: 'e.g. 2026-10-25 19:00  or  25 Oct 7pm  or  tomorrow 8pm', value: s && s.time }),
       textRow('notes', 'Notes (optional)', TextInputStyle.Paragraph, {
         required: false,
         max: 500,
         placeholder: 'Maps, format, lobby details...',
+        value: s && s.notes,
       })
     );
 }
@@ -627,21 +651,7 @@ async function createScrim(interaction, { team1, team2, time, notes }) {
     threadParentId: threadChannel.id,
   };
 
-  // Work out when it starts (in the server's timezone) so reminders and auto-close can run
-  const tz = cfg.timezone || 'UTC';
-  let timeNote = '';
-  const parsed = parseWhen(time, tz);
-  if (parsed !== null && parsed > Date.now()) {
-    s.startsAt = parsed;
-    for (const m of REMIND_MINUTES) if (Date.now() >= parsed - m * 60000) s.sent['rem' + m] = true; // no reminders for moments already passed
-    for (const m of UNCLAIMED_ALERT_MINUTES) if (Date.now() >= parsed - m * 60000) s.sent['unc' + m] = true;
-    timeNote = `\nStart time read as <t:${Math.floor(parsed / 1000)}:F> (server timezone ${tz}). If that's wrong, close the scrim and post it again.`;
-  } else {
-    timeNote =
-      parsed !== null
-        ? '\nThat time is in the past, so there will be no reminders.'
-        : `\nI couldn't read that time, so there will be no reminders. Try a format like \`2026-10-25 19:00\`, \`25 Oct 7pm\` or \`tomorrow 8pm\` (server timezone ${tz}). It will auto-close 48 hours after posting.`;
-  }
+  const timeNote = applyStartTime(s, cfg.timezone || 'UTC');
 
   // 1) create the private thread
   let thread;
@@ -1466,10 +1476,53 @@ client.on('interactionCreate', async (interaction) => {
       return createScrim(interaction, { team1, team2, time, notes });
     }
 
+    if (interaction.isModalSubmit && interaction.isModalSubmit() && interaction.customId.startsWith('scrimedit:')) {
+      await interaction.deferReply({ flags: EPHEMERAL });
+      const s = db.scrims[interaction.customId.split(':')[1]];
+      if (!s || isClosed(s)) return interaction.editReply({ content: 'This scrim is closed or gone, so it can no longer be edited.' });
+      if (interaction.user.id !== s.authorId && !isMod(interaction)) {
+        return interaction.editReply({ content: 'Only the poster or a moderator can edit this scrim.' });
+      }
+      const team1 = interaction.fields.getTextInputValue('team1').trim();
+      const team2 = interaction.fields.getTextInputValue('team2').trim();
+      const time = interaction.fields.getTextInputValue('time').trim();
+      const notes = (interaction.fields.getTextInputValue('notes') || '').trim();
+      if (!team1 || !team2 || !time) return interaction.editReply({ content: "Team 1, Team 2 and When can't be empty. Press **Edit** to try again." });
+
+      const changes = [];
+      if (team1 !== s.team1 || team2 !== s.team2) changes.push(`Teams: **${s.team1} vs ${s.team2}** to **${team1} vs ${team2}**`);
+      const teamsChanged = team1 !== s.team1 || team2 !== s.team2;
+      const timeChanged = time !== s.time;
+      if (notes !== (s.notes || '')) changes.push(notes ? 'Notes were updated' : 'Notes were removed');
+      s.team1 = team1;
+      s.team2 = team2;
+      s.notes = notes;
+      let timeNote = '';
+      if (timeChanged) {
+        const oldWhen = whenText(s);
+        s.time = time; // only re-read when the text changed, so "tomorrow 8pm" doesn't slide a day on an unrelated edit
+        timeNote = applyStartTime(s, (getConfig(s.guildId) || {}).timezone || 'UTC');
+        changes.push(`When: ${oldWhen} to ${whenText(s)}`);
+      }
+      if (!changes.length) return interaction.editReply({ content: 'Nothing was changed.' });
+      save();
+      await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
+      const t = await getThread(s);
+      if (t) {
+        if (teamsChanged) await t.setName(`Scrim #${s.id}: ${s.team1} vs ${s.team2}`.slice(0, 100)).catch(() => {}); // Discord limits renames, so this may be skipped
+        const people = [...new Set([s.authorId, ...s.casters, ...(s.cocasters || [])])];
+        await t
+          .send({ content: `<@${interaction.user.id}> edited this scrim:\n${changes.join('\n')}\n${people.map((id) => `<@${id}>`).join(' ')}`, allowedMentions: { users: people } })
+          .catch((e) => console.error('Could not post edit notice:', e.message));
+      }
+      await logEvent(s.guildId, `Scrim #${s.id} edited`, `<@${interaction.user.id}> edited **${s.team1} vs ${s.team2}**.\n${changes.join('\n')}`, 0xfee75c);
+      return interaction.editReply({ content: `Scrim #${s.id} updated.${timeNote}` });
+    }
+
     // ----- buttons -----
     if (interaction.isButton()) {
       const [action, idStr] = interaction.customId.split(':');
-      if (action !== 'claim' && action !== 'unclaim' && action !== 'close') return;
+      if (action !== 'claim' && action !== 'unclaim' && action !== 'close' && action !== 'edit') return;
       const s = db.scrims[idStr];
       if (!s) {
         return interaction.reply({ content: 'This scrim is no longer available.', flags: EPHEMERAL });
@@ -1489,6 +1542,13 @@ client.on('interactionCreate', async (interaction) => {
 
       if (isClosed(s)) {
         return interaction.reply({ content: 'This scrim is no longer available.', flags: EPHEMERAL });
+      }
+
+      if (action === 'edit') {
+        if (uid !== s.authorId && !isMod(interaction)) {
+          return interaction.reply({ content: 'Only the poster or a moderator can edit this scrim.', flags: EPHEMERAL });
+        }
+        return interaction.showModal(buildScrimModal(s));
       }
 
       if (action === 'claim') {
@@ -1551,11 +1611,136 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// Tiny web server so uptime pingers / "web service" hosts stay happy
-http
-  .createServer((_, res) => {
+// ---------- web dashboard (read-only; off unless DASHBOARD_TOKEN is set) ----------
+const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || '';
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const safeEqual = (a, b) => crypto.timingSafeEqual(crypto.createHash('sha256').update(String(a)).digest(), crypto.createHash('sha256').update(String(b)).digest());
+const nameCache = new Map();
+async function nameOf(id) {
+  if (nameCache.has(id)) return nameCache.get(id);
+  let n = client.users && client.users.cache && client.users.cache.get(id) && client.users.cache.get(id).username;
+  if (!n && client.users && client.users.fetch) {
+    n = await Promise.race([client.users.fetch(id).then((u) => u.username).catch(() => null), new Promise((r) => setTimeout(() => r(null), 1500))]);
+  }
+  if (n) nameCache.set(id, n);
+  return n || id;
+}
+function fmtWhen(ms, tz) {
+  try {
+    return new Date(ms).toLocaleString('en-AU', { timeZone: tz || 'UTC', dateStyle: 'medium', timeStyle: 'short' });
+  } catch {
+    return new Date(ms).toISOString();
+  }
+}
+
+async function renderDashboard() {
+  const all = Object.values(db.scrims);
+  const open = all.filter((s) => !isClosed(s)).sort((a, b) => (a.startsAt || Infinity) - (b.startsAt || Infinity) || a.id - b.id).slice(0, 50);
+  const recent = all.filter(isClosed).sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0) || b.id - a.id).slice(0, 20);
+  const stats = {};
+  for (const g of new Set(all.map((s) => s.guildId).filter(Boolean))) {
+    for (const [id, v] of Object.entries(collectStats(g))) {
+      const t = (stats[id] = stats[id] || { cast: 0, cocast: 0, posted: 0 });
+      t.cast += v.cast; t.cocast += v.cocast; t.posted += v.posted;
+    }
+  }
+  const top = Object.entries(stats).filter(([, v]) => v.cast + v.cocast > 0).sort((a, b) => b[1].cast - a[1].cast || b[1].cocast - a[1].cocast).slice(0, 10);
+  const ids = new Set();
+  for (const s of [...open, ...recent]) { ids.add(s.authorId); s.casters.forEach((i) => ids.add(i)); }
+  top.forEach(([id]) => ids.add(id));
+  await Promise.all([...ids].slice(0, 80).map(nameOf));
+  const nm = (id) => esc(nameCache.get(id) || id);
+
+  const card = (s) => {
+    const tz = (getConfig(s.guildId) || {}).timezone || 'UTC';
+    const closed = isClosed(s);
+    const label = closed ? (s.closedBy === 'auto' ? 'Closed (auto)' : 'Closed') : s.casters.length ? 'Claimed' : 'Needs caster';
+    const cls = closed ? 'closed' : s.casters.length ? 'claimed' : 'needs';
+    return `<div class="card"><div class="row"><b>#${s.id} ${esc(s.team1)} vs ${esc(s.team2)}</b><span class="badge ${cls}">${label}</span></div>` +
+      `<div class="muted">${s.startsAt ? esc(fmtWhen(s.startsAt, tz)) + ' (' + esc(tz) + ')' : esc(s.time)}</div>` +
+      `<div class="muted">Posted by ${nm(s.authorId)} · Caster: ${s.casters.length ? s.casters.map(nm).join(', ') : 'none'}${(s.cocasters || []).length ? ' · Co-casters: ' + s.cocasters.length : ''}</div></div>`;
+  };
+  const mb = (n) => Math.round(n / 1048576);
+  const health = [
+    ['Uptime', fmtUptime(process.uptime())],
+    ['Discord ping', `${Math.round(client.ws.ping)} ms`],
+    ['Bot memory', `${mb(process.memoryUsage().rss)} MB`],
+    ['Host memory free', `${mb(os.freemem())} / ${mb(os.totalmem())} MB`],
+    ['Load (1 min)', os.loadavg()[0].toFixed(2)],
+    ['Servers', client.guilds && client.guilds.cache ? client.guilds.cache.size : '?'],
+    ['Host', `${os.hostname()}${underPm2() ? ' · pm2' : ''}`],
+    ['Version', CODE_VERSION],
+  ].map(([k, v]) => `<div class="stat"><div class="muted">${k}</div><b>${esc(v)}</b></div>`).join('');
+  const logs = recentLogs.slice(-30).join('\n') || '(no logs yet)';
+
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>Scrim Bot Dashboard</title><style>
+:root{--bg:#f6f7f9;--fg:#1c1e21;--card:#fff;--line:#e2e5ea;--muted:#667085;--ok:#1a7f4b;--warn:#b54708;--bad:#b42318}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e8eaed;--card:#1e2126;--line:#2e3239;--muted:#9aa3b0;--ok:#57d98d;--warn:#f5b46a;--bad:#f28b82}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}main{max-width:820px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:4px 0 14px}h2{font-size:15px;margin:22px 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.stat,.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.card{margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.muted{color:var(--muted);font-size:13px}
+.badge{font-size:12px;border:1px solid currentColor;border-radius:99px;padding:1px 8px;white-space:nowrap}.needs{color:var(--bad)}.claimed{color:var(--ok)}.closed{color:var(--muted)}
+pre{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:12px}
+</style></head><body><main><h1>Scrim Bot</h1><div class="muted">Refreshes every 30s · ${esc(new Date().toISOString())}</div>
+<h2>Health</h2><div class="grid">${health}</div>
+<h2>Open scrims (${open.length})</h2>${open.map(card).join('') || '<div class="muted">None</div>'}
+<h2>Recently closed</h2>${recent.map(card).join('') || '<div class="muted">None</div>'}
+<h2>Top casters</h2>${top.map(([id, v], i) => `<div class="card">${i + 1}. <b>${nm(id)}</b> <span class="muted">${v.cast} cast · ${v.cocast} co-cast</span></div>`).join('') || '<div class="muted">No finished scrims yet</div>'}
+<h2>Recent logs</h2><pre>${esc(logs)}</pre></main></body></html>`;
+}
+
+const dashFails = new Map(); // ip -> { n, resetAt }
+async function handleHttp(req, res) {
+  const url = new URL(req.url || '/', 'http://localhost');
+  if (url.pathname !== '/dashboard') {
     res.writeHead(200);
-    res.end('Scrim bot is running');
+    return res.end('Scrim bot is running'); // keeps uptime pingers happy
+  }
+  if (!DASHBOARD_TOKEN) {
+    res.writeHead(404);
+    return res.end('The dashboard is off. Set DASHBOARD_TOKEN to turn it on.');
+  }
+  const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'" };
+  const ip = (req.socket && req.socket.remoteAddress) || '?';
+  const f = dashFails.get(ip);
+  if (f && Date.now() < f.resetAt && f.n >= 10) {
+    res.writeHead(429, headers);
+    return res.end('Too many attempts. Try again in a minute.');
+  }
+  const cookie = (req.headers.cookie || '').split(';').map((x) => x.trim()).find((x) => x.startsWith('dash='));
+  let cookieKey = '';
+  try {
+    cookieKey = cookie ? decodeURIComponent(cookie.slice(5)) : '';
+  } catch {
+    /* bad cookie */
+  }
+  const queryKey = url.searchParams.get('key');
+  const given = queryKey !== null ? queryKey : cookieKey;
+  if (!given || !safeEqual(given, DASHBOARD_TOKEN)) {
+    const cur = f && Date.now() < f.resetAt ? f : { n: 0, resetAt: Date.now() + 60000 };
+    cur.n += 1;
+    dashFails.set(ip, cur);
+    res.writeHead(401, headers);
+    return res.end('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:system-ui;padding:24px">Add <code>?key=YOUR_DASHBOARD_TOKEN</code> to the address.</body>');
+  }
+  if (queryKey !== null) {
+    // remember the key in a cookie and drop it from the address bar
+    res.writeHead(302, { Location: '/dashboard', 'Set-Cookie': `dash=${encodeURIComponent(DASHBOARD_TOKEN)}; Path=/dashboard; HttpOnly; SameSite=Strict; Max-Age=2592000`, 'Cache-Control': 'no-store' });
+    return res.end();
+  }
+  res.writeHead(200, headers);
+  res.end(await renderDashboard());
+}
+
+// Tiny web server: uptime pingers hit "/", and /dashboard shows the dashboard when DASHBOARD_TOKEN is set
+http
+  .createServer((req, res) => {
+    handleHttp(req, res).catch((e) => {
+      console.error('Web request failed:', e.message);
+      if (!res.headersSent) res.writeHead(500);
+      res.end('Something went wrong');
+    });
   })
   .listen(process.env.PORT || 3000);
 
