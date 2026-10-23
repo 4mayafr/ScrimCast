@@ -5,7 +5,7 @@ const http = require('http');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-9'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-10'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -91,6 +91,11 @@ const UNCLAIMED_ALERT_MINUTES = [60, 15]; // caster role is re-pinged if nobody 
 const AUTO_CLOSE_AFTER_MS = (Number(process.env.AUTO_CLOSE_HOURS) || 4) * 3600000; // closed this long after the start time
 const AUTO_CLOSE_NO_TIME_MS = 48 * 3600000; // scrims whose time couldn't be read are closed this long after posting
 const SCHEDULER_EVERY_MS = Number(process.env.SCHEDULER_EVERY_MS) || 30000;
+const MONITOR_EVERY_MS = Number(process.env.MONITOR_EVERY_MS) || 15000; // how often load is sampled for overload alerts
+const OVERLOAD_LOAD_PER_CORE = Number(process.env.OVERLOAD_LOAD_PER_CORE) || 1.5;
+const OVERLOAD_MIN_FREE_MEM = Number(process.env.OVERLOAD_MIN_FREE_MEM) || 0.08; // fraction of RAM
+const OVERLOAD_PING_MS = Number(process.env.OVERLOAD_PING_MS) || 1500;
+const OVERLOAD_LAG_MS = Number(process.env.OVERLOAD_LAG_MS) || 2000; // event loop delay
 const SERVER_LOG_EVERY_MS = Number(process.env.SERVER_LOG_EVERY_MS) || 60000; // how often the live server log is refreshed
 
 // ---------- tiny JSON storage ----------
@@ -292,10 +297,17 @@ const commands = [
             .setDescription('Optional: private channel for a live bot/server log that updates every minute')
             .addChannelTypes(ChannelType.GuildText)
         )
+        .addChannelOption((o) =>
+          o
+            .setName('status_channel')
+            .setDescription('Optional: alerts when the bot is overloaded, stopping, restarting or back online')
+            .addChannelTypes(ChannelType.GuildText)
+        )
         .addStringOption((o) =>
           o.setName('timezone').setDescription('Optional: timezone for scrim times, e.g. Australia/Melbourne (default UTC)')
         )
     )
+    .addSubcommand((c) => c.setName('statusalerts_off').setDescription('Turn off overloaded/shutdown/restart alerts'))
     .addSubcommand((c) => c.setName('serverlogs_off').setDescription('Turn the live server log off'))
     .addSubcommand((c) => c.setName('view').setDescription('Show the current setup'))
     .addSubcommand((c) => c.setName('panel').setDescription('Post the "Post Scrim" panel again (for example if it was deleted)'))
@@ -409,6 +421,9 @@ async function onReady() {
   setInterval(updateServerLogs, SERVER_LOG_EVERY_MS).unref();
   runScheduler();
   setInterval(runScheduler, SCHEDULER_EVERY_MS).unref();
+  lagLast = Date.now();
+  setInterval(monitorTick, MONITOR_EVERY_MS).unref();
+  announceStartup().catch((e) => console.error('Startup alert failed:', e.message));
   try {
     await registerCommands();
   } catch (e) {
@@ -722,6 +737,146 @@ const fmtUptime = (sec) => {
   return `${d ? d + 'd ' : ''}${h}h ${m}m`;
 };
 
+// ---------- status alerts: overloaded, shutting down, starting up ----------
+// Posts one embed to every server that has a status channel. Never throws; gives up after timeoutMs.
+async function announceStatus(title, description, color, timeoutMs = 3000) {
+  const tasks = [];
+  for (const cfg of Object.values(db.config)) {
+    if (!cfg || !cfg.statusChannelId) continue;
+    tasks.push(
+      (async () => {
+        const ch = await client.channels.fetch(cfg.statusChannelId).catch(() => null);
+        if (!ch) return;
+        await ch.send({ embeds: [new EmbedBuilder().setTitle(title).setColor(color).setDescription(description).setTimestamp()], allowedMentions: { parse: [] } });
+      })().catch((e) => console.error('Status alert failed:', e.message))
+    );
+  }
+  if (!tasks.length) return;
+  let timer;
+  await Promise.race([Promise.allSettled(tasks), new Promise((r) => (timer = setTimeout(r, timeoutMs)))]);
+  clearTimeout(timer);
+}
+
+const hostLine = () => `Host: ${os.hostname()} · version ${CODE_VERSION}`;
+let exiting = false;
+let announced = false;
+// Tells the status channels the bot is going down, records why (so the next start can say it), then exits.
+async function exitBot(kind, detail, { stopPm2 = false, timeoutMs = 3000 } = {}) {
+  if (exiting) return;
+  exiting = true;
+  db.shutdown = { at: Date.now(), kind, detail };
+  try {
+    save();
+  } catch {
+    /* ignore */
+  }
+  const titles = { restart: 'Restarting', update: 'Restarting to update', shutdown: 'Shutting down', signal: 'Stopping' };
+  const color = kind === 'shutdown' || kind === 'signal' ? 0xed4245 : 0xfee75c;
+  const more = kind === 'shutdown' ? '\nIt stays off until someone starts it again.' : kind === 'signal' ? '' : '\nBack in a few seconds.';
+  await announceStatus(titles[kind] || 'Stopping', `${detail}${more}\n${hostLine()}`, color, timeoutMs);
+  announced = true;
+  if (stopPm2 && underPm2()) {
+    // `pm2 stop` keeps pm2 from restarting the process
+    execFile('pm2', ['stop', String(process.env.pm_id)], (err) => {
+      if (err) {
+        console.error('pm2 stop failed:', err.message);
+        client.destroy();
+        process.exit(0); // pm2 will restart it; better than leaving it half-dead
+      }
+    });
+    return;
+  }
+  client.destroy();
+  process.exit(0);
+}
+function onStopSignal(sig) {
+  if (exiting) {
+    if (announced) process.exit(0); // second signal after the alert went out: stop now
+    return;
+  }
+  console.log(`Got ${sig}, shutting down.`);
+  exitBot('signal', `The host told the bot to stop (${sig}). This happens on \`pm2 restart\`, \`pm2 stop\`, an update, or when the computer shuts down.`, { timeoutMs: 1200 });
+}
+process.on('SIGINT', () => onStopSignal('SIGINT'));
+process.on('SIGTERM', () => onStopSignal('SIGTERM'));
+process.on('uncaughtException', (e) => {
+  console.error('CRASH:', e && e.stack ? e.stack : e);
+  try {
+    db.shutdown = { at: Date.now(), kind: 'crash', detail: shortErr(e) };
+    save();
+  } catch {
+    /* ignore */
+  }
+  process.exit(1); // pm2 starts it again; the next start reports the crash
+});
+
+// Runs once when the bot is ready: says it is back and why it was away
+async function announceStartup() {
+  const prev = db.shutdown;
+  const lastBeat = db.lastBeat;
+  db.shutdown = undefined;
+  db.lastBeat = Date.now();
+  save();
+  const upFor = Math.round(process.uptime());
+  let text;
+  if (prev) {
+    const away = Math.max(0, Math.round((Date.now() - prev.at) / 1000));
+    const why = prev.kind === 'crash' ? `It crashed: \`${String(prev.detail).slice(0, 300)}\`` : prev.kind === 'shutdown' ? 'It was turned off and started again.' : prev.kind === 'signal' ? 'The host stopped it (restart, stop, update or the computer shutting down).' : 'Planned restart.';
+    text = `Back online after about ${fmtUptime(away)} away. ${why}`;
+  } else if (lastBeat) {
+    text = `Back online. The last time it was seen alive was <t:${Math.floor(lastBeat / 1000)}:R>, and it did not shut down cleanly. That means a crash, power loss, sleep or a lost connection.`;
+  } else {
+    text = 'Online for the first time.';
+  }
+  await announceStatus('Back online', `${text}\nStarted and connected in ${upFor}s.\n${hostLine()}`, 0x57f287);
+}
+
+// Overload watcher: alerts after 3 bad samples in a row, and again when it has been fine for 4 in a row
+let monitorBad = 0;
+let monitorGood = 0;
+let overloaded = false;
+let lastOverloadAlert = 0;
+let lagLast = Date.now();
+function overloadReasons() {
+  const reasons = [];
+  const cores = os.cpus().length || 1;
+  const load = os.loadavg()[0] / cores;
+  if (load >= OVERLOAD_LOAD_PER_CORE) reasons.push(`CPU load ${os.loadavg()[0].toFixed(2)} on ${cores} core(s)`);
+  const free = os.freemem() / os.totalmem();
+  if (free <= OVERLOAD_MIN_FREE_MEM) reasons.push(`only ${(free * 100).toFixed(0)}% of memory free`);
+  const ping = client.ws.ping;
+  if (ping >= OVERLOAD_PING_MS) reasons.push(`Discord ping ${Math.round(ping)} ms`);
+  const lag = Date.now() - lagLast - MONITOR_EVERY_MS;
+  if (lag >= OVERLOAD_LAG_MS) reasons.push(`the bot stalled for ${(lag / 1000).toFixed(1)}s`);
+  return reasons;
+}
+async function monitorTick() {
+  const reasons = overloadReasons();
+  lagLast = Date.now();
+  db.lastBeat = Date.now(); // heartbeat, so an unclean stop can be noticed next start
+  try {
+    save();
+  } catch {
+    /* ignore */
+  }
+  if (reasons.length) {
+    monitorGood = 0;
+    monitorBad += 1;
+    if (!overloaded && monitorBad >= 3 && Date.now() - lastOverloadAlert > 300000) {
+      overloaded = true;
+      lastOverloadAlert = Date.now();
+      await announceStatus('Bot overloaded', `${reasons.join('\n')}\nThe bot may be slow or miss things until this passes. If it keeps happening, restart the host.\n${hostLine()}`, 0xed4245);
+    }
+  } else {
+    monitorBad = 0;
+    monitorGood += 1;
+    if (overloaded && monitorGood >= 4) {
+      overloaded = false;
+      await announceStatus('Back to normal', `The bot is no longer overloaded.\n${hostLine()}`, 0x57f287);
+    }
+  }
+}
+
 // ---------- closing, reminders and auto-close ----------
 // byId is the user who closed it, or 'auto'. `ack` runs right after the scrim is marked closed (used to answer the button press).
 async function closeScrim(s, byId, ack) {
@@ -955,10 +1110,7 @@ async function handleAdmin(interaction) {
 
       if (wantRestart && underPm2()) {
         await interaction.editReply({ content: text + '\nRestarting now to run the new code. Back in a few seconds.' });
-        setTimeout(() => {
-          client.destroy();
-          process.exit(0); // pm2 starts it again with the new code
-        }, 500);
+        exitBot('update', `<@${interaction.user.id}> ran \`/admin update\` and the bot is restarting to run the new code.`); // pm2 starts it again
         return;
       }
       text += wantRestart
@@ -984,30 +1136,13 @@ async function handleAdmin(interaction) {
       });
     }
     await interaction.editReply({ content: 'Restarting now. I should be back in a few seconds.' });
-    setTimeout(() => {
-      client.destroy();
-      process.exit(0); // pm2 starts it again
-    }, 500);
+    exitBot('restart', `<@${interaction.user.id}> ran \`/admin restart\`.`); // pm2 starts it again
     return;
   }
 
   if (sub === 'shutdown') {
     await interaction.editReply({ content: 'Shutting down. Start me again from the Chromebook with `pm2 start scrim-bot`.' });
-    setTimeout(() => {
-      if (underPm2()) {
-        // `pm2 stop` keeps pm2 from restarting the process
-        execFile('pm2', ['stop', String(process.env.pm_id)], (err) => {
-          if (err) {
-            console.error('pm2 stop failed:', err.message);
-            client.destroy();
-            process.exit(0); // pm2 will restart it; better than leaving it half-dead
-          }
-        });
-      } else {
-        client.destroy();
-        process.exit(0);
-      }
-    }, 500);
+    exitBot('shutdown', `<@${interaction.user.id}> ran \`/admin shutdown\`.`, { stopPm2: true });
     return;
   }
 }
@@ -1038,6 +1173,7 @@ client.on('interactionCreate', async (interaction) => {
               `**Post Scrim panel:** ${c.panelChannelId ? `<#${c.panelChannelId}>` : 'not set, run `/setup set` again'}\n` +
               `**Scrims are posted in:** <#${c.postChannelId}>\n` +
               `**Log channel:** ${c.logChannelId ? `<#${c.logChannelId}>` : 'not set, run `/setup set` again'}\n` +
+              `**Status alerts:** ${c.statusChannelId ? `<#${c.statusChannelId}>` : 'off'}\n` +
               `**Timezone:** ${c.timezone || 'UTC (change it with the timezone option of `/setup set`)'}\n` +
               `**Live server log:** ${c.serverLogChannelId ? `<#${c.serverLogChannelId}> (updates every minute)` : 'off'}\n` +
               `**Private threads are created in:** <#${c.threadChannelId}>\n` +
@@ -1054,6 +1190,14 @@ client.on('interactionCreate', async (interaction) => {
               ? `Posted the Post Scrim panel in <#${c.panelChannelId}>.`
               : `I couldn't post the panel in <#${c.panelChannelId}>: ${r.reason}`,
           });
+        }
+
+        if (sub === 'statusalerts_off') {
+          const c = getConfig(interaction.guildId);
+          if (!c || !c.statusChannelId) return interaction.editReply({ content: 'Status alerts are already off.' });
+          c.statusChannelId = undefined;
+          save();
+          return interaction.editReply({ content: 'Turned status alerts off.' });
         }
 
         if (sub === 'serverlogs_off') {
@@ -1080,6 +1224,7 @@ client.on('interactionCreate', async (interaction) => {
         const threads = interaction.options.getChannel('thread_channel', true);
         const role = interaction.options.getRole('caster_role', true);
         const serverLog = interaction.options.getChannel('server_log_channel'); // optional
+        const statusCh = interaction.options.getChannel('status_channel'); // optional
         const tzInput = interaction.options.getString ? interaction.options.getString('timezone') : null; // optional
         if (tzInput && !validTimezone(tzInput.trim())) {
           return interaction.editReply({ content: `"${tzInput}" isn't a timezone I know. Use a name like \`Australia/Melbourne\`, \`Europe/London\` or \`America/New_York\`. Nothing was changed.` });
@@ -1097,6 +1242,7 @@ client.on('interactionCreate', async (interaction) => {
           panelMessage: previous ? previous.panelMessage : undefined, // so the old panel can be replaced
           serverLogChannelId: serverLog ? serverLog.id : previous ? previous.serverLogChannelId : undefined,
           serverLogMessage: keepServerLog && previous ? previous.serverLogMessage : undefined,
+          statusChannelId: statusCh ? statusCh.id : previous ? previous.statusChannelId : undefined,
           timezone: tzInput ? tzInput.trim() : previous ? previous.timezone : undefined,
         };
         save();
@@ -1112,6 +1258,10 @@ client.on('interactionCreate', async (interaction) => {
           if (m2.length) warnings.push(`I'm missing in <#${threads.id}>: ${m2.join(', ')}`);
           const m3 = missingPerms(logCh, me, ['ViewChannel', 'SendMessages', 'EmbedLinks']);
           if (m3.length) warnings.push(`I'm missing in <#${logCh.id}>: ${m3.join(', ')}`);
+          if (statusCh) {
+            const m5 = missingPerms(statusCh, me, ['ViewChannel', 'SendMessages', 'EmbedLinks']);
+            if (m5.length) warnings.push(`I'm missing in <#${statusCh.id}>: ${m5.join(', ')}`);
+          }
           if (serverLog) {
             const m4 = missingPerms(serverLog, me, ['ViewChannel', 'SendMessages', 'EmbedLinks']);
             if (m4.length) warnings.push(`I'm missing in <#${serverLog.id}>: ${m4.join(', ')}`);
@@ -1121,6 +1271,13 @@ client.on('interactionCreate', async (interaction) => {
         if (!logOk) warnings.push(`I couldn't post in the log channel <#${logCh.id}>. Check my permissions there.`);
         const panelResult = await postPanel(interaction.guildId);
         if (!panelResult.ok) warnings.push(`I couldn't post the panel in <#${panel.id}>: ${panelResult.reason}. Fix it, then run \`/setup panel\`.`);
+        if (statusCh) {
+          try {
+            await statusCh.send({ embeds: [new EmbedBuilder().setTitle('Status alerts on').setColor(0x57f287).setDescription("I'll post here when the bot is overloaded, stopping, restarting or back online.").setTimestamp()], allowedMentions: { parse: [] } });
+          } catch (e) {
+            warnings.push(`I couldn't post in the status channel <#${statusCh.id}>: ${e.message}`);
+          }
+        }
         const serverLogId = db.config[interaction.guildId].serverLogChannelId;
         if (serverLogId) {
           try {
@@ -1135,6 +1292,7 @@ client.on('interactionCreate', async (interaction) => {
             `**Post Scrim panel:** <#${panel.id}>${panelResult.ok ? ' (posted)' : ''}\n` +
             `**Scrims are posted in:** <#${post.id}>\n` +
             `**Log channel:** <#${logCh.id}>\n` +
+            `**Status alerts:** ${db.config[interaction.guildId].statusChannelId ? `<#${db.config[interaction.guildId].statusChannelId}>` : 'off (add the optional status_channel to turn it on)'}\n` +
             `**Timezone:** ${db.config[interaction.guildId].timezone || 'UTC (add the optional timezone option so scrim times are read correctly)'}\n` +
             `**Live server log:** ${serverLogId ? `<#${serverLogId}> (updates every minute)` : 'off (add the optional server_log_channel to turn it on)'}\n` +
             `**Private threads are created in:** <#${threads.id}>\n` +
