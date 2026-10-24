@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-15'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-17'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -88,6 +88,9 @@ const MAX_CASTERS = 1; // casters per scrim
 const MAX_COCASTERS = 4; // co-casters per scrim
 const PING_COOLDOWN_MS = 10000;
 const ENV_FILE = process.env.ENV_FILE || path.join(__dirname, '.env');
+const DOWNTIME_TICK_MS = Number(process.env.DOWNTIME_TICK_MS) || 15000;
+const CLIPS_DELAY_MS = (process.env.CLIPS_DELAY_MINUTES !== undefined && process.env.CLIPS_DELAY_MINUTES.trim() !== '' && Number.isFinite(Number(process.env.CLIPS_DELAY_MINUTES)) ? Number(process.env.CLIPS_DELAY_MINUTES) : 30) * 60000; // 0 turns the clips reminder off
+const CLIPS_MESSAGE = (process.env.CLIPS_MESSAGE || '').trim() || 'please send your clips';
 const REMIND_MINUTES = [30, 5]; // reminders in the thread before a scrim starts
 const UNCLAIMED_ALERT_MINUTES = [60, 15]; // caster role is re-pinged if nobody has claimed by then
 const AUTO_CLOSE_AFTER_MS = (Number(process.env.AUTO_CLOSE_HOURS) || 4) * 3600000; // closed this long after the start time
@@ -295,6 +298,8 @@ const ENV_KEYS = {
   OVERLOAD_MIN_FREE_MEM: { check: num(0.01, 0.9) },
   OVERLOAD_PING_MS: { check: num(100, 60000) },
   OVERLOAD_LAG_MS: { check: num(100, 60000) },
+  CLIPS_DELAY_MINUTES: { check: num(0, 1440) },
+  CLIPS_MESSAGE: { max: 200, check: () => null },
   // the /aleisha command
   ALEISHA_MESSAGE: { long: true, max: 1000, check: () => null },
   ALEISHA_IMAGE: { max: 300, check: (v) => (/^https:\/\/\S+$/.test(v) ? null : 'must be a link starting with https://') },
@@ -501,6 +506,17 @@ const commands = [
         .addStringOption((o) => o.setName('key').setDescription('Which setting').setRequired(true).addChoices(...ENV_CHOICES))
         .addBooleanOption((o) => o.setName('restart').setDescription('Restart afterwards so it takes effect (needs pm2)'))
     )
+    .addSubcommand((c) =>
+      c
+        .setName('downtime_set')
+        .setDescription('Schedule downtime. Everyone is warned in the status channel beforehand')
+        .addStringOption((o) => o.setName('start').setDescription('When it starts, e.g. "now", "tomorrow 8pm" or "2026-10-25 19:00"').setRequired(true))
+        .addStringOption((o) => o.setName('duration').setDescription('How long, e.g. "30m", "2h" or "1h30m"').setRequired(true))
+        .addStringOption((o) => o.setName('reason').setDescription('Optional: why (shown to everyone)'))
+        .addBooleanOption((o) => o.setName('shutdown').setDescription('True = really shut the bot down (start it again yourself). Default: pause it'))
+    )
+    .addSubcommand((c) => c.setName('downtime_cancel').setDescription('Cancel the scheduled downtime, or end it early'))
+    .addSubcommand((c) => c.setName('downtime_view').setDescription('Show the scheduled downtime'))
     .addSubcommand((c) => c.setName('restart').setDescription('Restart the bot (needs pm2 to come back by itself)'))
     .addSubcommand((c) => c.setName('shutdown').setDescription('Turn the bot off (under pm2 it stays off until you start it again)'))
     .toJSON(),
@@ -593,11 +609,7 @@ async function onReady() {
   if (started) return;
   started = true;
   console.log(`Logged in as ${client.user.tag}`);
-  try {
-    client.user.setPresence({ status: 'online', activities: [{ name: STATUS_TEXT, type: ActivityType.Playing }] });
-  } catch (e) {
-    console.error('Could not set status:', e.message);
-  }
+  applyPresence();
   // Keep the live server log fresh (one message per server, edited every minute)
   updateServerLogs();
   setInterval(updateServerLogs, SERVER_LOG_EVERY_MS).unref();
@@ -605,7 +617,13 @@ async function onReady() {
   setInterval(runScheduler, SCHEDULER_EVERY_MS).unref();
   lagLast = Date.now();
   setInterval(monitorTick, MONITOR_EVERY_MS).unref();
-  announceStartup().catch((e) => console.error('Startup alert failed:', e.message));
+  announceStartup()
+    .catch((e) => console.error('Startup alert failed:', e.message))
+    .finally(() => {
+      applyPresence();
+      downtimeTick();
+      setInterval(downtimeTick, DOWNTIME_TICK_MS).unref();
+    });
   try {
     await registerCommands();
   } catch (e) {
@@ -940,9 +958,9 @@ async function exitBot(kind, detail, { stopPm2 = false, timeoutMs = 3000 } = {})
   } catch {
     /* ignore */
   }
-  const titles = { restart: 'Restarting', update: 'Restarting to update', shutdown: 'Shutting down', signal: 'Stopping' };
-  const color = kind === 'shutdown' || kind === 'signal' ? 0xed4245 : 0xfee75c;
-  const more = kind === 'shutdown' ? '\nIt stays off until someone starts it again.' : kind === 'signal' ? '' : '\nBack in a few seconds.';
+  const titles = { restart: 'Restarting', update: 'Restarting to update', shutdown: 'Shutting down', signal: 'Stopping', scheduled: 'Scheduled downtime started' };
+  const color = kind === 'shutdown' || kind === 'signal' || kind === 'scheduled' ? 0xed4245 : 0xfee75c;
+  const more = kind === 'shutdown' || kind === 'scheduled' ? '\nIt stays off until someone starts it again.' : kind === 'signal' ? '' : '\nBack in a few seconds.';
   await announceStatus(titles[kind] || 'Stopping', `${detail}${more}\n${hostLine()}`, color, timeoutMs);
   announced = true;
   if (stopPm2 && underPm2()) {
@@ -980,6 +998,84 @@ process.on('uncaughtException', (e) => {
   process.exit(1); // pm2 starts it again; the next start reports the crash
 });
 
+// ---------- scheduled downtime ----------
+// db.downtime = { startAt, endAt, reason, hard, by, active, sent }. Soft: the bot stays on but pauses (commands say it's
+// under maintenance). Hard: the bot also shuts itself down at the start time and has to be started again.
+const maintenanceActive = () => Boolean(db.downtime && db.downtime.active && Date.now() < db.downtime.endAt);
+const downtimeLine = () => {
+  const d = db.downtime;
+  if (!d) return '';
+  const a = Math.floor(d.startAt / 1000);
+  const b = Math.floor(d.endAt / 1000);
+  return d.active ? `In effect until <t:${b}:t> (<t:${b}:R>)` : `Scheduled <t:${a}:F> to <t:${b}:t> (<t:${a}:R>)`;
+};
+const maintenanceText = () => {
+  const d = db.downtime;
+  return `The bot is down for scheduled maintenance until <t:${Math.floor(d.endAt / 1000)}:t> (<t:${Math.floor(d.endAt / 1000)}:R>).${d.reason ? `\nReason: ${d.reason}` : ''}`;
+};
+function applyPresence() {
+  try {
+    if (maintenanceActive()) client.user.setPresence({ status: 'dnd', activities: [{ name: 'Down for maintenance', type: ActivityType.Playing }] });
+    else client.user.setPresence({ status: 'online', activities: [{ name: STATUS_TEXT, type: ActivityType.Playing }] });
+  } catch (e) {
+    console.error('Could not set status:', e.message);
+  }
+}
+function parseDuration(text) {
+  const t = String(text).trim().toLowerCase();
+  if (/^\d+(\.\d+)?$/.test(t)) return Number(t) * 60000; // a bare number means minutes
+  const re = /(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m)(?![a-z])/g;
+  let total = 0;
+  let m;
+  while ((m = re.exec(t))) total += Number(m[1]) * (m[2][0] === 'd' ? 86400000 : m[2][0] === 'h' ? 3600000 : 60000);
+  if (!total || t.replace(re, '').replace(/and|[\s,]/g, '').length) return null;
+  return total;
+}
+const downtimeAnnounceText = (d) => {
+  const a = Math.floor(d.startAt / 1000);
+  const b = Math.floor(d.endAt / 1000);
+  return `From <t:${a}:F> (<t:${a}:R>) until <t:${b}:t>.${d.reason ? `\nReason: ${d.reason}` : ''}\n${d.hard ? 'The bot will shut down for this time and be started again afterwards.' : 'The bot stays on but pauses: commands and buttons will say it is under maintenance.'}`;
+};
+async function downtimeTick() {
+  const d = db.downtime;
+  if (!d) return;
+  const now = Date.now();
+  d.sent = d.sent || {};
+  if (now >= d.endAt) {
+    const wasActive = d.active;
+    db.downtime = undefined;
+    save();
+    applyPresence();
+    if (wasActive) await announceStatus('Maintenance finished', `The scheduled downtime is over and the bot is back to normal.\n${hostLine()}`, 0x57f287);
+    return;
+  }
+  if (now >= d.startAt) {
+    if (!d.active) {
+      d.active = true;
+      save();
+      applyPresence();
+      if (d.hard) {
+        await exitBot('scheduled', `Scheduled downtime has started (until <t:${Math.floor(d.endAt / 1000)}:t>).${d.reason ? `\nReason: ${d.reason}` : ''}`, { stopPm2: true });
+      } else {
+        await announceStatus('Scheduled downtime started', `The bot is paused until <t:${Math.floor(d.endAt / 1000)}:t> (<t:${Math.floor(d.endAt / 1000)}:R>).${d.reason ? `\nReason: ${d.reason}` : ''}`, 0xed4245);
+      }
+    }
+    return;
+  }
+  // before the start: reminders 1 hour and 10 minutes ahead
+  const left = d.startAt - now;
+  for (const [key, ms] of [['h1', 3600000], ['m10', 600000]]) {
+    if (left <= ms && !d.sent[key]) {
+      const newer = key === 'h1' && left <= 600000; // already inside the last 10 minutes: skip the hour reminder
+      d.sent.h1 = d.sent.h1 || key === 'm10' || newer;
+      if (newer) continue;
+      d.sent[key] = true;
+      save();
+      await announceStatus(key === 'h1' ? 'Scheduled downtime in 1 hour' : 'Scheduled downtime in 10 minutes', downtimeAnnounceText(d), 0xfee75c);
+    }
+  }
+}
+
 // Runs once when the bot is ready: says it is back and why it was away
 async function announceStartup() {
   const prev = db.shutdown;
@@ -989,16 +1085,29 @@ async function announceStartup() {
   save();
   const upFor = Math.round(process.uptime());
   let text;
+  let downtimeNote = '';
+  const d = db.downtime;
+  if (d) {
+    if (Date.now() >= d.endAt) {
+      downtimeNote = '\nThe scheduled downtime is over.';
+      db.downtime = undefined;
+      save();
+    } else if (Date.now() >= d.startAt) {
+      d.active = true;
+      save();
+      downtimeNote = `\nA scheduled downtime is still in effect until <t:${Math.floor(d.endAt / 1000)}:t>, so commands stay paused. End it early with \`/admin downtime_cancel\`.`;
+    }
+  }
   if (prev) {
     const away = Math.max(0, Math.round((Date.now() - prev.at) / 1000));
-    const why = prev.kind === 'crash' ? `It crashed: \`${String(prev.detail).slice(0, 300)}\`` : prev.kind === 'shutdown' ? 'It was turned off and started again.' : prev.kind === 'signal' ? 'The host stopped it (restart, stop, update or the computer shutting down).' : 'Planned restart.';
+    const why = prev.kind === 'crash' ? `It crashed: \`${String(prev.detail).slice(0, 300)}\`` : prev.kind === 'shutdown' ? 'It was turned off and started again.' : prev.kind === 'scheduled' ? 'That was the scheduled downtime.' : prev.kind === 'signal' ? 'The host stopped it (restart, stop, update or the computer shutting down).' : 'Planned restart.';
     text = `Back online after about ${fmtUptime(away)} away. ${why}`;
   } else if (lastBeat) {
     text = `Back online. The last time it was seen alive was <t:${Math.floor(lastBeat / 1000)}:R>, and it did not shut down cleanly. That means a crash, power loss, sleep or a lost connection.`;
   } else {
     text = 'Online for the first time.';
   }
-  await announceStatus('Back online', `${text}\nStarted and connected in ${upFor}s.\n${hostLine()}`, 0x57f287);
+  await announceStatus('Back online', `${text}${downtimeNote}\nStarted and connected in ${upFor}s.\n${hostLine()}`, 0x57f287);
 }
 
 // Overload watcher: alerts after 3 bad samples in a row, and again when it has been fine for 4 in a row
@@ -1084,6 +1193,22 @@ async function schedulerStep(s, now) {
   }
   const closeAt = s.startsAt ? s.startsAt + AUTO_CLOSE_AFTER_MS : s.createdAt + AUTO_CLOSE_NO_TIME_MS;
   if (now >= closeAt) return closeScrim(s, 'auto');
+  // Some time after the start, remind the caster to send their clips (once)
+  if (s.startsAt && CLIPS_DELAY_MS > 0 && now >= s.startsAt + CLIPS_DELAY_MS) {
+    s.sent = s.sent || {};
+    if (!s.sent.clips) {
+      s.sent.clips = true; // marked even when nobody claimed, so a late claim doesn't trigger it
+      save();
+      if (s.casters.length) {
+        const t = await getThread(s);
+        if (t) {
+          await t
+            .send({ content: `${s.casters.map((id) => `<@${id}>`).join(' ')} ${CLIPS_MESSAGE}`, allowedMentions: { users: s.casters } })
+            .catch((e) => console.error('Could not send clips reminder:', e.message));
+        }
+      }
+    }
+  }
   if (!s.startsAt || now >= s.startsAt) return;
   s.sent = s.sent || {};
   const cfg = getConfig(s.guildId);
@@ -1189,7 +1314,8 @@ function buildServerLogEmbed() {
       { name: 'Memory', value: `bot ${mb(process.memoryUsage().rss)} MB, host free ${mb(os.freemem())} of ${mb(os.totalmem())} MB`, inline: true },
       { name: 'Load (1 min)', value: os.loadavg()[0].toFixed(2), inline: true },
       { name: 'Scrims', value: `${all.length} total, ${open} waiting for a caster`, inline: true },
-      { name: 'Version', value: `${CODE_VERSION}${underPm2() ? ' · pm2' : ''}`, inline: true }
+      { name: 'Version', value: `${CODE_VERSION}${underPm2() ? ' · pm2' : ''}`, inline: true },
+      ...(db.downtime ? [{ name: 'Scheduled downtime', value: downtimeLine() }] : [])
     );
 }
 
@@ -1251,6 +1377,52 @@ async function handleAdmin(interaction) {
   await interaction.deferReply({ flags: EPHEMERAL });
   const sub = interaction.options.getSubcommand();
 
+  if (sub === 'downtime_view') {
+    return interaction.editReply({ content: db.downtime ? `**Scheduled downtime**\n${downtimeLine()}\n${downtimeAnnounceText(db.downtime)}` : 'No downtime is scheduled.' });
+  }
+
+  if (sub === 'downtime_cancel') {
+    const d = db.downtime;
+    if (!d) return interaction.editReply({ content: 'No downtime is scheduled.' });
+    db.downtime = undefined;
+    save();
+    applyPresence();
+    await announceStatus(d.active ? 'Maintenance ended early' : 'Scheduled downtime cancelled', d.active ? 'The bot is back to normal.' : 'The planned downtime will not happen after all.', 0x57f287);
+    return interaction.editReply({ content: d.active ? 'Ended the maintenance early. The bot is back to normal.' : 'Cancelled the scheduled downtime.' });
+  }
+
+  if (sub === 'downtime_set') {
+    if (db.downtime) return interaction.editReply({ content: `A downtime is already set (${downtimeLine()}). Cancel it first with \`/admin downtime_cancel\`.` });
+    const tz = (getConfig(interaction.guildId) || {}).timezone || 'UTC';
+    const startText = interaction.options.getString('start').trim();
+    const startAt = /^now$/i.test(startText) ? Date.now() : parseWhen(startText, tz);
+    if (startAt === null) {
+      return interaction.editReply({ content: `I couldn't read that start time. Try \`now\`, \`tomorrow 8pm\`, \`25 Oct 7pm\` or \`2026-10-25 19:00\` (read in ${tz}).` });
+    }
+    if (startAt < Date.now() - 60000) return interaction.editReply({ content: 'That start time is in the past.' });
+    if (startAt > Date.now() + 30 * 86400000) return interaction.editReply({ content: 'That is more than 30 days away. Pick something sooner.' });
+    const ms = parseDuration(interaction.options.getString('duration'));
+    if (ms === null) return interaction.editReply({ content: 'I couldn\'t read that duration. Try `30m`, `2h` or `1h30m`.' });
+    if (ms < 300000 || ms > 7 * 86400000) return interaction.editReply({ content: 'The downtime has to be between 5 minutes and 7 days.' });
+    const reason = (interaction.options.getString('reason') || '').trim().slice(0, 200);
+    const hard = interaction.options.getBoolean('shutdown') === true;
+    if (hard && !underPm2()) {
+      return interaction.editReply({ content: "A real shutdown needs pm2 (otherwise I'd have no way to stay stopped). Leave `shutdown` off to just pause the bot, or start me with pm2." });
+    }
+    const d = (db.downtime = { startAt, endAt: startAt + ms, reason, hard, by: interaction.user.id, active: false, sent: {} });
+    if (d.startAt - Date.now() <= 3600000) d.sent.h1 = true; // no point reminding "in 1 hour" for something sooner
+    if (d.startAt - Date.now() <= 600000) d.sent.m10 = true;
+    save();
+    const hasChannel = Object.values(db.config).some((c) => c && c.statusChannelId);
+    await announceStatus('Scheduled downtime', downtimeAnnounceText(d), 0xfee75c);
+    downtimeTick(); // starts right away when the start time is "now"
+    return interaction.editReply({
+      content:
+        `Scheduled: ${downtimeLine()}\n${hard ? 'The bot will shut down at the start and stay off. Start it again with `pm2 start scrim-bot` (it also ends by itself after the end time).' : 'The bot will stay on but pause.'}` +
+        (hasChannel ? '\nAnnounced in the status channel, with reminders 1 hour and 10 minutes before.' : '\nNo status channel is set, so nobody was told. Add one with the `status_channel` option of `/setup set`.'),
+    });
+  }
+
   if (sub === 'env_view') {
     const content = readEnvFile();
     const lines = Object.entries(ENV_KEYS).map(([k, spec]) => {
@@ -1292,6 +1464,7 @@ async function handleAdmin(interaction) {
         `Running on: ${os.hostname()} (${process.platform})\n` +
         `Code version: ${CODE_VERSION}\n` +
         `Commands on Discord: ${liveCommandsNote}\n` +
+        (db.downtime ? `Downtime: ${downtimeLine()}\n` : '') +
         `Uptime: ${fmtUptime(process.uptime())}\n` +
         `Discord ping: ${Math.round(client.ws.ping)} ms\n` +
         `Memory: ${mb(process.memoryUsage().rss)} MB\n` +
@@ -1372,6 +1545,11 @@ async function handleAdmin(interaction) {
 client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isModalSubmit && interaction.isModalSubmit() && interaction.customId.startsWith('envset:')) return handleEnvModal(interaction);
+
+    // During scheduled maintenance everything except the bot owner's /admin says so
+    if (maintenanceActive() && !(interaction.isChatInputCommand && interaction.isChatInputCommand() && interaction.commandName === 'admin')) {
+      return interaction.reply({ content: maintenanceText(), flags: EPHEMERAL, allowedMentions: { parse: [] } });
+    }
 
     // ----- slash commands -----
     if (interaction.isChatInputCommand()) {
@@ -1926,6 +2104,7 @@ async function renderDashboard() {
     ['Servers', client.guilds && client.guilds.cache ? client.guilds.cache.size : '?'],
     ['Host', `${os.hostname()}${underPm2() ? ' · pm2' : ''}`],
     ['Version', CODE_VERSION],
+    ...(db.downtime ? [['Scheduled downtime', db.downtime.active ? 'in effect until ' + new Date(db.downtime.endAt).toISOString().slice(0, 16) + 'Z' : new Date(db.downtime.startAt).toISOString().slice(0, 16) + 'Z']] : []),
   ].map(([k, v]) => `<div class="stat"><div class="muted">${k}</div><b>${esc(v)}</b></div>`).join('');
   const logs = recentLogs.slice(-30).join('\n') || '(no logs yet)';
 
