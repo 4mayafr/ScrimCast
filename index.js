@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const CODE_VERSION = 'panel-form-17'; // shown in /admin status so you can tell which copy of the bot is answering
+const CODE_VERSION = 'panel-form-20'; // shown in /admin status so you can tell which copy of the bot is answering
 
 // Some home networks / containers have broken IPv6; try IPv4 addresses first so connections don't stall
 try {
@@ -49,6 +49,8 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  UserSelectMenuBuilder,
+  StringSelectMenuBuilder,
 } = require('discord.js');
 
 // Short, readable version of an error (network errors can be huge AggregateErrors)
@@ -203,7 +205,7 @@ const whenText = (s) => (s.startsAt ? `<t:${Math.floor(s.startsAt / 1000)}:F> (<
 
 // Reads s.time in the server's timezone and sets startsAt plus which reminders are already behind us.
 // Returns a note to show the person who typed the time.
-function applyStartTime(s, tz) {
+function applyStartTime(s, tz, preview = false) {
   s.startsAt = null;
   s.sent = {};
   const parsed = parseWhen(s.time, tz);
@@ -211,29 +213,45 @@ function applyStartTime(s, tz) {
     s.startsAt = parsed;
     for (const m of REMIND_MINUTES) if (Date.now() >= parsed - m * 60000) s.sent['rem' + m] = true; // no reminders for moments already passed
     for (const m of UNCLAIMED_ALERT_MINUTES) if (Date.now() >= parsed - m * 60000) s.sent['unc' + m] = true;
-    return `\nStart time read as <t:${Math.floor(parsed / 1000)}:F> (server timezone ${tz}). If that's wrong, press **Edit** on the scrim to fix it.`;
+    return `\nStart time read as <t:${Math.floor(parsed / 1000)}:F> (server timezone ${tz}). ${preview ? "If that's wrong, press **Change**." : "If that's wrong, press **Edit** on the scrim to fix it."}`;
   }
-  if (parsed !== null) return '\nThat time is in the past, so there will be no reminders.';
-  return `\nI couldn't read that time, so there will be no reminders. Try a format like \`2026-10-25 19:00\`, \`25 Oct 7pm\` or \`tomorrow 8pm\` (server timezone ${tz}). It will auto-close 48 hours after posting.`;
+  if (parsed !== null) return `\nThat time is in the past, so there will be no reminders.${preview ? ' Press **Change** to fix it.' : ''}`;
+  return `\nI couldn't read that time, so there will be no reminders. Try a format like \`2026-10-25 19:00\`, \`25 Oct 7pm\` or \`tomorrow 8pm\` (server timezone ${tz}). It will auto-close 48 hours after posting.${preview ? ' Press **Change** to fix it, or post it anyway.' : ''}`;
 }
 
 // ---------- UI helpers ----------
+const scrimStatus = (s) => (isClosed(s) ? 'closed' : s.casters.length >= MAX_CASTERS ? 'claimed' : 'open');
+const scrimLink = (s) => (s.guildId && s.channelId && s.messageId ? `https://discord.com/channels/${s.guildId}/${s.channelId}/${s.messageId}` : null);
+const threadLink = (s) => (s.guildId && s.threadId ? `https://discord.com/channels/${s.guildId}/${s.threadId}` : null);
+
+// One line that says where the scrim stands, with a live countdown when the start time is known
+function statusLine(s) {
+  const st = scrimStatus(s);
+  if (st === 'closed') return `⚫ **Closed**${s.closedBy === 'auto' ? ' (automatically)' : ''}`;
+  const when = s.startsAt ? ` · <t:${Math.floor(s.startsAt / 1000)}:R>` : '';
+  return st === 'open' ? `🟢 **Needs a caster**${when}` : `🔵 **Caster found**${when}`;
+}
+
 function buildEmbed(s) {
   const cocasters = s.cocasters || [];
-  const open = s.casters.length < MAX_CASTERS && !isClosed(s);
+  const st = scrimStatus(s);
   const embed = new EmbedBuilder()
     .setTitle(`${s.team1} vs ${s.team2}`)
-    .setColor(isClosed(s) ? 0x808080 : open ? 0x57f287 : 0xed4245)
+    .setColor(st === 'closed' ? 0x808080 : st === 'open' ? 0x57f287 : 0x5865f2)
+    .setDescription(statusLine(s))
     .addFields(
       { name: 'When', value: whenText(s), inline: true },
       { name: 'Posted by', value: `<@${s.authorId}>`, inline: true },
+      { name: '\u200b', value: '\u200b', inline: true }, // keeps the next two side by side
       {
         name: `Caster (${s.casters.length}/${MAX_CASTERS})`,
         value: s.casters.length ? s.casters.map((id) => `<@${id}>`).join('\n') : '*No caster yet*',
+        inline: true,
       },
       {
         name: `Co-casters (${cocasters.length}/${MAX_COCASTERS})`,
         value: cocasters.length ? cocasters.map((id) => `<@${id}>`).join('\n') : '*None yet*',
+        inline: true,
       }
     )
     .setFooter({ text: `Scrim #${s.id}${isClosed(s) ? ' · CLOSED' : ''}` });
@@ -249,17 +267,17 @@ function buildButtons(s) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`claim:${s.id}`)
-      .setLabel(full ? 'Claimed' : 'Claim as Caster')
+      .setLabel(full ? 'Caster claimed' : 'Claim as Caster')
       .setStyle(ButtonStyle.Success)
       .setDisabled(full || isClosed(s)),
     new ButtonBuilder()
       .setCustomId(`cocast:${s.id}`)
-      .setLabel('Claim as Co-caster')
+      .setLabel('Join as Co-caster')
       .setStyle(ButtonStyle.Primary)
       .setDisabled((s.cocasters || []).length >= MAX_COCASTERS || isClosed(s)),
     new ButtonBuilder()
       .setCustomId(`unclaim:${s.id}`)
-      .setLabel('Unclaim')
+      .setLabel('Leave')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(isClosed(s)),
     new ButtonBuilder()
@@ -270,9 +288,12 @@ function buildButtons(s) {
   );
 }
 
-// The "Close Scrim" button that lives inside the scrim's private thread
-function buildCloseRow(s, closed = false) {
+// The buttons inside the scrim's private thread. Everything the slash commands do is here too, so nobody has to type.
+// (Older threads only have the single Close Scrim button; its id still works.)
+function buildThreadRow(s, closed = false) {
   return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`tping:${s.id}`).setLabel('Ping everyone').setStyle(ButtonStyle.Secondary).setDisabled(closed),
+    new ButtonBuilder().setCustomId(`tco:${s.id}`).setLabel('Co-casters').setStyle(ButtonStyle.Secondary).setDisabled(closed),
     new ButtonBuilder()
       .setCustomId(`close:${s.id}`)
       .setLabel(closed ? 'Closed' : 'Close Scrim')
@@ -521,6 +542,8 @@ const commands = [
     .addSubcommand((c) => c.setName('shutdown').setDescription('Turn the bot off (under pm2 it stays off until you start it again)'))
     .toJSON(),
 
+  new SlashCommandBuilder().setName('help').setDescription('How the scrim board works').toJSON(),
+
   new SlashCommandBuilder()
     .setName('aleisha')
     .setDescription((process.env.ALEISHA_DESCRIPTION || 'Aleisha').trim().slice(0, 100) || 'Aleisha')
@@ -730,18 +753,82 @@ async function refreshMessage(interaction, s) {
 // ---------- the "Post Scrim" panel and its form ----------
 function buildPanelEmbed() {
   return new EmbedBuilder()
-    .setTitle('Post a scrim')
+    .setTitle('Scrim Board')
     .setColor(0x5865f2)
     .setDescription(
-      'Need a caster for your scrim? Press **Post Scrim** and fill in the form.\n\n' +
-        'Your scrim is posted for casters to claim, and you get a private thread to talk with the caster and co-casters.'
-    );
+      'Need a caster for your scrim, or want to cast one? Start here.\n\n' +
+        '**1. Post** your scrim with the button below.\n' +
+        '**2. Casters** claim it from the scrim post.\n' +
+        "**3. Chat** in the scrim's private thread, then close it when it's over."
+    )
+    .setFooter({ text: 'Open scrims shows what needs a caster. My scrims shows yours.' });
 }
 
 function buildPanelButtons() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('postscrim').setLabel('Post Scrim').setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId('postscrim').setLabel('Post Scrim').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('browse:open').setLabel('Open scrims').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('browse:mine').setLabel('My scrims').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('help').setLabel('Help').setStyle(ButtonStyle.Secondary)
   );
+}
+
+// ---------- browsing and help ----------
+const mdSafe = (t) => String(t).replace(/[\[\]]/g, '');
+const scrimWhen = (s) => (s.startsAt ? `<t:${Math.floor(s.startsAt / 1000)}:R>` : mdSafe(s.time).slice(0, 40));
+const scrimItem = (s) => {
+  const label = `#${s.id} ${mdSafe(s.team1)} vs ${mdSafe(s.team2)}`;
+  const link = scrimLink(s);
+  return `${link ? `[${label}](${link})` : label} · ${scrimWhen(s)}`;
+};
+const byStart = (a, b) => (a.startsAt || Infinity) - (b.startsAt || Infinity) || a.id - b.id;
+const listLines = (list, max = 8) => list.slice(0, max).map(scrimItem).join('\n') + (list.length > max ? `\n...and ${list.length - max} more` : '');
+
+function openScrimsEmbed(guildId) {
+  const open = Object.values(db.scrims).filter((s) => s.guildId === guildId && !isClosed(s));
+  const need = open.filter((s) => !s.casters.length).sort(byStart);
+  const room = open.filter((s) => s.casters.length && (s.cocasters || []).length < MAX_COCASTERS).sort(byStart);
+  return new EmbedBuilder()
+    .setTitle('Open scrims')
+    .setColor(0x57f287)
+    .setDescription(
+      (
+        (need.length ? `**Waiting for a caster (${need.length})**\n${listLines(need)}` : 'Nothing is waiting for a caster right now.') +
+        (room.length ? `\n\n**Room for co-casters (${room.length})**\n${listLines(room)}` : '')
+      ).slice(0, 4000) // embeds are limited to 4096 characters
+    )
+    .setFooter({ text: 'Click a scrim to jump to it, then press Claim.' });
+}
+
+function myScrimsEmbed(guildId, uid) {
+  const mine = Object.values(db.scrims)
+    .filter((s) => s.guildId === guildId && !isClosed(s) && (s.authorId === uid || s.casters.includes(uid) || (s.cocasters || []).includes(uid)))
+    .sort(byStart);
+  const role = (s) => [s.authorId === uid && 'poster', s.casters.includes(uid) && 'caster', (s.cocasters || []).includes(uid) && 'co-caster'].filter(Boolean).join(' & ');
+  const st = collectStats(guildId)[uid] || { cast: 0, cocast: 0, posted: 0 };
+  const lines = mine.slice(0, 15).map((s) => `${scrimItem(s)} · ${role(s)}`).join('\n') + (mine.length > 15 ? `\n...and ${mine.length - 15} more` : '');
+  return new EmbedBuilder()
+    .setTitle('Your scrims')
+    .setColor(0x5865f2)
+    .setDescription(mine.length ? lines.slice(0, 4000) : "You don't have any open scrims.")
+    .setFooter({ text: `All time: ${st.posted} posted · ${st.cast} cast · ${st.cocast} co-cast` });
+}
+
+function helpEmbed(guildId) {
+  const cfg = guildId ? getConfig(guildId) : null;
+  const ready = configComplete(cfg);
+  const e = new EmbedBuilder()
+    .setTitle('How the scrim board works')
+    .setColor(0x5865f2)
+    .addFields(
+      { name: 'Post a scrim', value: 'Press **Post Scrim** on the panel, fill in the teams and time, check the preview, then press **Post scrim**. A private thread is made for it.' },
+      { name: 'Cast a scrim', value: `${ready ? `You need the <@&${cfg.casterRoleId}> role. ` : ''}Press **Claim as Caster** on a scrim, or **Join as Co-caster** to help (up to ${MAX_COCASTERS}). **Leave** gives your spot up.` },
+      { name: 'In the thread', value: '**Ping everyone** notifies the thread. **Co-casters** adds or removes co-casters. **Close Scrim** locks it when you are done.' },
+      { name: 'Times', value: `Write the time like \`2026-10-25 19:00\`, \`25 Oct 7pm\` or \`tomorrow 8pm\`${ready ? ` (read in ${cfg.timezone || 'UTC'})` : ''}. Everyone sees it in their own timezone, and the thread gets reminders.` },
+      { name: 'Commands', value: '`/stats user` and `/stats leaderboard` show casting stats. `/help` shows this.' }
+    );
+  if (guildId && !ready) e.setFooter({ text: "This server isn't set up yet. The server owner needs to run /setup set." });
+  return e;
 }
 
 function textRow(id, label, style, { required = true, max, placeholder, value }) {
@@ -756,22 +843,45 @@ function textRow(id, label, style, { required = true, max, placeholder, value })
   return new ActionRowBuilder().addComponents(input);
 }
 
-function buildScrimModal(s) {
-  // With a scrim given, this is the Edit form: same fields, pre-filled
+// The form for posting, changing a draft, or editing a posted scrim. `v` pre-fills the fields.
+function buildScrimModal(v = {}, { id = 'scrimform', title = 'Post a scrim' } = {}) {
   return new ModalBuilder()
-    .setCustomId(s ? `scrimedit:${s.id}` : 'scrimform')
-    .setTitle(s ? `Edit scrim #${s.id}` : 'Post a scrim')
+    .setCustomId(id)
+    .setTitle(title.slice(0, 45))
     .addComponents(
-      textRow('team1', 'Team 1', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Red Dragons', value: s && s.team1 }),
-      textRow('team2', 'Team 2', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Blue Wolves', value: s && s.team2 }),
-      textRow('time', 'When', TextInputStyle.Short, { max: 100, placeholder: 'e.g. 2026-10-25 19:00  or  25 Oct 7pm  or  tomorrow 8pm', value: s && s.time }),
+      textRow('team1', 'Team 1', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Red Dragons', value: v.team1 }),
+      textRow('team2', 'Team 2', TextInputStyle.Short, { max: 50, placeholder: 'e.g. Blue Wolves', value: v.team2 }),
+      textRow('time', 'When', TextInputStyle.Short, { max: 100, placeholder: 'e.g. 2026-10-25 19:00  or  25 Oct 7pm  or  tomorrow 8pm', value: v.time }),
       textRow('notes', 'Notes (optional)', TextInputStyle.Paragraph, {
         required: false,
         max: 500,
         placeholder: 'Maps, format, lobby details...',
-        value: s && s.notes,
+        value: v.notes,
       })
     );
+}
+
+// ---------- drafts: the preview shown before a scrim is posted ----------
+const drafts = new Map(); // id -> { userId, guildId, team1, team2, time, notes, at, posting }
+const DRAFT_TTL_MS = 30 * 60000;
+function pruneDrafts() {
+  for (const [id, d] of drafts) if (Date.now() - d.at > DRAFT_TTL_MS) drafts.delete(id);
+}
+function buildDraftView(id, d, tz) {
+  const tmp = { id: 'preview', guildId: d.guildId, team1: d.team1, team2: d.team2, time: d.time, notes: d.notes, authorId: d.userId, casters: [], cocasters: [], closed: false };
+  const note = applyStartTime(tmp, tz, true);
+  const embed = buildEmbed(tmp).setFooter({ text: 'Preview. Nothing is posted until you press Post scrim.' });
+  return {
+    content: `**Check your scrim before it goes out**${note}`,
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`draft:post:${id}`).setLabel('Post scrim').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`draft:edit:${id}`).setLabel('Change').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`draft:discard:${id}`).setLabel('Discard').setStyle(ButtonStyle.Danger)
+      ),
+    ],
+  };
 }
 
 // Posts the panel in the configured panel channel, replacing the previous one. Returns { ok, reason }.
@@ -872,10 +982,11 @@ async function createScrim(interaction, { team1, team2, time, notes }) {
     .send({
       content:
         `**Scrim #${s.id}: ${s.team1} vs ${s.team2}** (${whenText(s)})\n` +
-        `Posted by <@${s.authorId}>. The caster who claims this scrim is added here automatically.\n` +
-        `The caster can add up to ${MAX_COCASTERS} co-casters with \`/scrim addcocaster\`, and ping everyone here with \`/scrim ping\`.\n` +
-        'Press **Close Scrim** below when the scrim is over.',
-      components: [buildCloseRow(s)],
+        `Posted by <@${s.authorId}>. The caster who claims this scrim is added here automatically.\n\n` +
+        `**Ping everyone** sends a message that notifies everyone in this thread (lobby code, server details...).\n` +
+        `**Co-casters** lets the caster or poster add or remove up to ${MAX_COCASTERS} co-casters.\n` +
+        '**Close Scrim** locks this thread when the scrim is over.',
+      components: [buildThreadRow(s)],
       allowedMentions: { parse: [] },
     })
     .catch((e) => console.error('Could not send thread intro:', e.message));
@@ -886,10 +997,92 @@ async function createScrim(interaction, { team1, team2, time, notes }) {
     0x5865f2
   );
 
-  return interaction.editReply({ content: `Scrim #${s.id} posted in <#${s.channelId}>. Thread: <#${thread.id}>${timeNote}` });
+  const links = [scrimLink(s) && new ButtonBuilder().setLabel('View scrim').setStyle(ButtonStyle.Link).setURL(scrimLink(s)), threadLink(s) && new ButtonBuilder().setLabel('Open thread').setStyle(ButtonStyle.Link).setURL(threadLink(s))].filter(Boolean);
+  await interaction.editReply({
+    content: `Scrim #${s.id} posted in <#${s.channelId}>. Thread: <#${thread.id}>${timeNote}`,
+    components: links.length ? [new ActionRowBuilder().addComponents(...links)] : [],
+  });
+  return true;
 }
 
 const pingCooldown = new Map();
+
+// ---------- actions shared by the slash commands and the thread buttons ----------
+const canManageCocasters = (s, uid, mod) => s.casters.includes(uid) || s.authorId === uid || mod;
+const NOT_ALLOWED_COCASTERS = 'Only the caster who claimed this scrim (or the poster) can change co-casters.';
+
+// Each returns the text to show the person who did it
+async function addCocasterTo(s, uid, target) {
+  s.cocasters = s.cocasters || [];
+  if (target.bot) return "You can't add a bot.";
+  if (target.id === s.authorId || s.casters.includes(target.id)) return `<@${target.id}> is already in the thread.`;
+  if (s.cocasters.includes(target.id)) return `<@${target.id}> is already a co-caster on this scrim.`;
+  if (s.cocasters.length >= MAX_COCASTERS) {
+    return `This scrim already has ${MAX_COCASTERS} co-casters, which is the maximum. Remove one first.`;
+  }
+  const ok = await addToThread(s, target.id, `<@${target.id}> was added as a co-caster by <@${uid}>.`);
+  if (!ok) {
+    return `I couldn't add <@${target.id}>. Check that they can see <#${s.threadParentId || s.channelId}> and that I have **Manage Threads** there.`;
+  }
+  s.cocasters.push(target.id);
+  save();
+  await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
+  logEvent(s.guildId, `Scrim #${s.id} co-caster added`, `<@${uid}> added <@${target.id}> as a co-caster on **${s.team1} vs ${s.team2}**.`, 0x5865f2);
+  return `Added <@${target.id}> as a co-caster. Thread: <#${s.threadId}>`;
+}
+
+async function removeCocasterFrom(s, uid, targetId) {
+  s.cocasters = s.cocasters || [];
+  if (!s.cocasters.includes(targetId)) return `<@${targetId}> isn't a co-caster on this scrim.`;
+  await removeFromThread(s, targetId, `<@${targetId}> was removed as a co-caster by <@${uid}>.`);
+  s.cocasters = s.cocasters.filter((id) => id !== targetId);
+  save();
+  await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
+  logEvent(s.guildId, `Scrim #${s.id} co-caster removed`, `<@${uid}> removed <@${targetId}> as a co-caster on **${s.team1} vs ${s.team2}**.`, 0x5865f2);
+  return `Removed <@${targetId}> as a co-caster.`;
+}
+
+const canPing = (s, uid, mod) => s.authorId === uid || s.casters.includes(uid) || (s.cocasters || []).includes(uid) || mod;
+async function pingThread(s, uid, text) {
+  const wait = PING_COOLDOWN_MS - (Date.now() - (pingCooldown.get(uid) || 0));
+  if (wait > 0) return `Slow down, you can ping again in ${Math.ceil(wait / 1000)}s.`;
+  const others = [...new Set([s.authorId, ...s.casters, ...(s.cocasters || [])])].filter((id) => id !== uid);
+  if (!others.length) return 'Nobody else is in the thread yet.';
+  const t = await getThread(s);
+  if (!t) return "I can't find the scrim thread. It may have been deleted.";
+  // Only the thread members are pinged, so @everyone / @here / roles in the text do nothing
+  await t.send({
+    content: `${others.map((id) => `<@${id}>`).join(' ')}\n**Message from <@${uid}>:** ${text}`,
+    allowedMentions: { users: others },
+  });
+  pingCooldown.set(uid, Date.now());
+  return `Pinged ${others.length} ${others.length === 1 ? 'person' : 'people'} in <#${s.threadId}>.`;
+}
+
+// The ephemeral panel behind the thread's "Co-casters" button: pick someone to add, or pick a co-caster to remove
+async function buildCoManager(s) {
+  const co = s.cocasters || [];
+  const full = co.length >= MAX_COCASTERS;
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new UserSelectMenuBuilder()
+        .setCustomId(`tcoadd:${s.id}`)
+        .setPlaceholder(full ? 'All co-caster spots are taken' : 'Add a co-caster')
+        .setMinValues(1)
+        .setMaxValues(1)
+        .setDisabled(full)
+    ),
+  ];
+  if (co.length) {
+    const options = await Promise.all(co.map(async (id) => ({ label: String(await nameOf(id)).slice(0, 100), value: id })));
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder().setCustomId(`tcorm:${s.id}`).setPlaceholder('Remove a co-caster').setMinValues(1).setMaxValues(1).addOptions(options)
+      )
+    );
+  }
+  return { content: `**Co-casters (${co.length}/${MAX_COCASTERS})**\n${co.length ? co.map((id) => `<@${id}>`).join('\n') : 'None yet.'}`, components: rows };
+}
 
 // The bot owner is the owner of the Discord application (or a member of its team), or BOT_OWNER_ID if set
 async function isBotOwner(userId) {
@@ -1555,15 +1748,16 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'admin') return handleAdmin(interaction);
       if (interaction.commandName === 'aleisha') return handleAleisha(interaction);
+      if (interaction.commandName === 'help') return interaction.reply({ embeds: [helpEmbed(interaction.guildId)], flags: EPHEMERAL });
 
       if (!interaction.guildId || !interaction.guild) {
         return interaction.reply({ content: 'Use this command in a server.', flags: EPHEMERAL });
       }
 
-      // ===== /setup (server owner only) =====
+      // ===== /setup (the server owner, or the bot's owner) =====
       if (interaction.commandName === 'setup') {
-        if (interaction.user.id !== interaction.guild.ownerId) {
-          return interaction.reply({ content: 'Only the server owner can use `/setup`.', flags: EPHEMERAL });
+        if (interaction.user.id !== interaction.guild.ownerId && !(await isBotOwner(interaction.user.id))) {
+          return interaction.reply({ content: 'Only the server owner or the bot owner can use `/setup`.', flags: EPHEMERAL });
         }
         await interaction.deferReply({ flags: EPHEMERAL });
         const sub = interaction.options.getSubcommand();
@@ -1766,49 +1960,10 @@ client.on('interactionCreate', async (interaction) => {
           if (!s) return;
 
           const uid = interaction.user.id;
-          if (!s.casters.includes(uid) && s.authorId !== uid && !isMod(interaction)) {
-            return interaction.editReply({ content: 'Only the caster who claimed this scrim (or the poster) can change co-casters.' });
-          }
-
+          if (!canManageCocasters(s, uid, isMod(interaction))) return interaction.editReply({ content: NOT_ALLOWED_COCASTERS });
           const target = interaction.options.getUser('user');
-          s.cocasters = s.cocasters || [];
-
-          if (sub === 'addcocaster') {
-            if (target.bot) return interaction.editReply({ content: "You can't add a bot." });
-            if (target.id === s.authorId || s.casters.includes(target.id)) {
-              return interaction.editReply({ content: `<@${target.id}> is already in the thread.` });
-            }
-            if (s.cocasters.includes(target.id)) {
-              return interaction.editReply({ content: `<@${target.id}> is already a co-caster on this scrim.` });
-            }
-            if (s.cocasters.length >= MAX_COCASTERS) {
-              return interaction.editReply({ content: `This scrim already has ${MAX_COCASTERS} co-casters, which is the maximum. Remove one first with \`/scrim removecocaster\`.` });
-            }
-            const ok = await addToThread(s, target.id, `<@${target.id}> was added as a co-caster by <@${uid}>.`);
-            if (!ok) {
-              return interaction.editReply({
-                content:
-                  `I couldn't add <@${target.id}>. Check that they can see <#${s.threadParentId || s.channelId}> ` +
-                  'and that I have **Manage Threads** there.',
-              });
-            }
-            s.cocasters.push(target.id);
-            save();
-            await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
-            logEvent(s.guildId || interaction.guildId, `Scrim #${s.id} co-caster added`, `<@${uid}> added <@${target.id}> as a co-caster on **${s.team1} vs ${s.team2}**.`, 0x5865f2);
-            return interaction.editReply({ content: `Added <@${target.id}> as a co-caster. Thread: <#${s.threadId}>` });
-          }
-
-          // removecocaster
-          if (!s.cocasters.includes(target.id)) {
-            return interaction.editReply({ content: `<@${target.id}> isn't a co-caster on this scrim.` });
-          }
-          await removeFromThread(s, target.id, `<@${target.id}> was removed as a co-caster by <@${uid}>.`);
-          s.cocasters = s.cocasters.filter((id) => id !== target.id);
-          save();
-          await editScrimMessage(s).catch((e) => console.error('Could not edit scrim message:', e.message));
-          logEvent(s.guildId || interaction.guildId, `Scrim #${s.id} co-caster removed`, `<@${uid}> removed <@${target.id}> as a co-caster on **${s.team1} vs ${s.team2}**.`, 0x5865f2);
-          return interaction.editReply({ content: `Removed <@${target.id}> as a co-caster.` });
+          const text = sub === 'addcocaster' ? await addCocasterTo(s, uid, target) : await removeCocasterFrom(s, uid, target.id);
+          return interaction.editReply({ content: text.replace('Remove one first.', 'Remove one first with `/scrim removecocaster`.') });
         }
 
         if (sub === 'ping') {
@@ -1817,32 +1972,48 @@ client.on('interactionCreate', async (interaction) => {
           if (!s) return;
 
           const uid = interaction.user.id;
-          const inThread = s.authorId === uid || s.casters.includes(uid) || (s.cocasters || []).includes(uid);
-          if (!inThread && !isMod(interaction)) {
-            return interaction.editReply({ content: 'Only people in the scrim thread can ping it.' });
-          }
-          const wait = PING_COOLDOWN_MS - (Date.now() - (pingCooldown.get(uid) || 0));
-          if (wait > 0) {
-            return interaction.editReply({ content: `Slow down, you can ping again in ${Math.ceil(wait / 1000)}s.` });
-          }
-
-          const others = [...new Set([s.authorId, ...s.casters, ...(s.cocasters || [])])].filter((id) => id !== uid);
-          if (!others.length) return interaction.editReply({ content: 'Nobody else is in the thread yet.' });
-
-          const t = await getThread(s);
-          if (!t) return interaction.editReply({ content: "I can't find the scrim thread. It may have been deleted." });
-
-          const text = interaction.options.getString('message');
-          // Only the thread members are pinged, so @everyone / @here / roles in the text do nothing
-          await t.send({
-            content: `${others.map((id) => `<@${id}>`).join(' ')}\n**Message from <@${uid}>:** ${text}`,
-            allowedMentions: { users: others },
-          });
-          pingCooldown.set(uid, Date.now());
-          return interaction.editReply({ content: `Pinged ${others.length} ${others.length === 1 ? 'person' : 'people'} in <#${s.threadId}>.` });
+          if (!canPing(s, uid, isMod(interaction))) return interaction.editReply({ content: 'Only people in the scrim thread can ping it.' });
+          return interaction.editReply({ content: await pingThread(s, uid, interaction.options.getString('message')) });
         }
       }
       return;
+    }
+
+    // ----- preview buttons: Post scrim / Change / Discard -----
+    if (interaction.isButton() && interaction.customId.startsWith('draft:')) {
+      const [, act, id] = interaction.customId.split(':');
+      const d = drafts.get(id);
+      if (!d || d.userId !== interaction.user.id) {
+        return interaction.update({ content: 'This preview expired. Press **Post Scrim** on the panel to start again.', embeds: [], components: [] });
+      }
+      if (act === 'discard') {
+        drafts.delete(id);
+        return interaction.update({ content: 'Discarded. Nothing was posted.', embeds: [], components: [] });
+      }
+      if (act === 'edit') return interaction.showModal(buildScrimModal(d, { id: `scrimform:${id}`, title: 'Change your scrim' }));
+      if (act === 'post') {
+        if (d.posting) return interaction.deferUpdate(); // a double click
+        d.posting = true;
+        await interaction.deferUpdate();
+        // createScrim talks to an interaction that is already answered; this clears the preview as it replies
+        const adapter = { guildId: interaction.guildId, user: interaction.user, editReply: async (o) => {
+            await interaction.editReply({ embeds: [], components: [], ...o });
+          },
+        }; // returns nothing, so only createScrim's own `return true` counts as success
+        const ok = await createScrim(adapter, d);
+        if (ok) drafts.delete(id);
+        else d.posting = false;
+        return;
+      }
+      return;
+    }
+
+    // ----- panel buttons: browse and help -----
+    if (interaction.isButton() && (interaction.customId === 'browse:open' || interaction.customId === 'browse:mine' || interaction.customId === 'help')) {
+      if (interaction.customId === 'help') return interaction.reply({ embeds: [helpEmbed(interaction.guildId)], flags: EPHEMERAL });
+      if (!interaction.guildId) return interaction.reply({ content: 'Use this in a server.', flags: EPHEMERAL });
+      const embed = interaction.customId === 'browse:open' ? openScrimsEmbed(interaction.guildId) : myScrimsEmbed(interaction.guildId, interaction.user.id);
+      return interaction.reply({ embeds: [embed], flags: EPHEMERAL, allowedMentions: { parse: [] } });
     }
 
     // ----- the "Post Scrim" button opens the form -----
@@ -1857,16 +2028,59 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     // ----- the submitted form creates the scrim -----
-    if (interaction.isModalSubmit && interaction.isModalSubmit() && interaction.customId === 'scrimform') {
-      await interaction.deferReply({ flags: EPHEMERAL });
+    if (interaction.isModalSubmit && interaction.isModalSubmit() && (interaction.customId === 'scrimform' || interaction.customId.startsWith('scrimform:'))) {
+      const cfg = interaction.guildId ? getConfig(interaction.guildId) : null;
+      if (!configComplete(cfg)) {
+        return interaction.reply({ content: 'This server is not set up yet. The server owner needs to run `/setup set` first.', flags: EPHEMERAL });
+      }
       const team1 = interaction.fields.getTextInputValue('team1').trim();
       const team2 = interaction.fields.getTextInputValue('team2').trim();
       const time = interaction.fields.getTextInputValue('time').trim();
       const notes = (interaction.fields.getTextInputValue('notes') || '').trim();
       if (!team1 || !team2 || !time) {
-        return interaction.editReply({ content: 'Team 1, Team 2 and When can\'t be empty. Press **Post Scrim** to try again.' });
+        return interaction.reply({ content: "Team 1, Team 2 and When can't be empty. Press **Post Scrim** to try again.", flags: EPHEMERAL });
       }
-      return createScrim(interaction, { team1, team2, time, notes });
+      pruneDrafts();
+      const uid = interaction.user.id;
+      let id = interaction.customId.split(':')[1];
+      if (!id || !drafts.get(id) || drafts.get(id).userId !== uid) id = crypto.randomBytes(4).toString('hex');
+      drafts.set(id, { userId: uid, guildId: interaction.guildId, team1, team2, time, notes, at: Date.now() });
+      const view = buildDraftView(id, drafts.get(id), cfg.timezone || 'UTC');
+      // Changing a draft updates the preview in place; a fresh form shows a new private preview
+      if (interaction.customId.includes(':') && interaction.isFromMessage && interaction.isFromMessage()) return interaction.update(view);
+      return interaction.reply({ ...view, flags: EPHEMERAL });
+    }
+
+    if (interaction.isModalSubmit && interaction.isModalSubmit() && interaction.customId.startsWith('tpingform:')) {
+      await interaction.deferReply({ flags: EPHEMERAL });
+      const s = db.scrims[interaction.customId.split(':')[1]];
+      if (!s || isClosed(s) || !s.threadId) return interaction.editReply({ content: 'That scrim is closed or gone.' });
+      if (!canPing(s, interaction.user.id, isMod(interaction))) return interaction.editReply({ content: 'Only people in the scrim thread can ping it.' });
+      const text = interaction.fields.getTextInputValue('message').trim();
+      if (!text) return interaction.editReply({ content: "The message can't be empty." });
+      return interaction.editReply({ content: await pingThread(s, interaction.user.id, text) });
+    }
+
+    // ----- select menus in the co-caster manager -----
+    if (interaction.isUserSelectMenu && interaction.isUserSelectMenu() && interaction.customId.startsWith('tcoadd:')) {
+      const s = db.scrims[interaction.customId.split(':')[1]];
+      if (!s || isClosed(s)) return interaction.update({ content: 'That scrim is closed or gone.', components: [] });
+      if (!canManageCocasters(s, interaction.user.id, isMod(interaction))) return interaction.reply({ content: NOT_ALLOWED_COCASTERS, flags: EPHEMERAL });
+      const pickedId = interaction.values[0];
+      const target = (interaction.users && interaction.users.get && interaction.users.get(pickedId)) || { id: pickedId, bot: false };
+      await interaction.deferUpdate();
+      const text = await addCocasterTo(s, interaction.user.id, target);
+      const view = await buildCoManager(s);
+      return interaction.editReply({ ...view, content: `${view.content}\n\n${text}` });
+    }
+    if (interaction.isStringSelectMenu && interaction.isStringSelectMenu() && interaction.customId.startsWith('tcorm:')) {
+      const s = db.scrims[interaction.customId.split(':')[1]];
+      if (!s || isClosed(s)) return interaction.update({ content: 'That scrim is closed or gone.', components: [] });
+      if (!canManageCocasters(s, interaction.user.id, isMod(interaction))) return interaction.reply({ content: NOT_ALLOWED_COCASTERS, flags: EPHEMERAL });
+      await interaction.deferUpdate();
+      const text = await removeCocasterFrom(s, interaction.user.id, interaction.values[0]);
+      const view = await buildCoManager(s);
+      return interaction.editReply({ ...view, content: `${view.content}\n\n${text}` });
     }
 
     if (interaction.isModalSubmit && interaction.isModalSubmit() && interaction.customId.startsWith('scrimedit:')) {
@@ -1915,7 +2129,7 @@ client.on('interactionCreate', async (interaction) => {
     // ----- buttons -----
     if (interaction.isButton()) {
       const [action, idStr] = interaction.customId.split(':');
-      if (action !== 'claim' && action !== 'unclaim' && action !== 'close' && action !== 'edit' && action !== 'cocast') return;
+      if (action !== 'claim' && action !== 'unclaim' && action !== 'close' && action !== 'edit' && action !== 'cocast' && action !== 'tping' && action !== 'tco') return;
       const s = db.scrims[idStr];
       if (!s) {
         return interaction.reply({ content: 'This scrim is no longer available.', flags: EPHEMERAL });
@@ -1929,7 +2143,7 @@ client.on('interactionCreate', async (interaction) => {
         if (uid !== s.authorId && !s.casters.includes(uid) && !isMod(interaction)) {
           return interaction.reply({ content: 'Only the poster, the caster or a moderator can close this scrim.', flags: EPHEMERAL });
         }
-        await closeScrim(s, uid, () => interaction.update({ components: [buildCloseRow(s, true)] })); // greys out the button right away
+        await closeScrim(s, uid, () => interaction.update({ components: [buildThreadRow(s, true)] })); // greys out the button right away
         return;
       }
 
@@ -1937,11 +2151,26 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: 'This scrim is no longer available.', flags: EPHEMERAL });
       }
 
+      if (action === 'tping') {
+        if (!canPing(s, uid, isMod(interaction))) return interaction.reply({ content: 'Only people in the scrim thread can ping it.', flags: EPHEMERAL });
+        return interaction.showModal(
+          new ModalBuilder()
+            .setCustomId(`tpingform:${s.id}`)
+            .setTitle(`Ping scrim #${s.id}`.slice(0, 45))
+            .addComponents(textRow('message', 'Message for everyone in the thread', TextInputStyle.Paragraph, { max: 1000, placeholder: 'Lobby code, server details, time change...' }))
+        );
+      }
+
+      if (action === 'tco') {
+        if (!canManageCocasters(s, uid, isMod(interaction))) return interaction.reply({ content: NOT_ALLOWED_COCASTERS, flags: EPHEMERAL });
+        return interaction.reply({ ...(await buildCoManager(s)), flags: EPHEMERAL });
+      }
+
       if (action === 'edit') {
         if (uid !== s.authorId && !isMod(interaction)) {
           return interaction.reply({ content: 'Only the poster or a moderator can edit this scrim.', flags: EPHEMERAL });
         }
-        return interaction.showModal(buildScrimModal(s));
+        return interaction.showModal(buildScrimModal(s, { id: `scrimedit:${s.id}`, title: `Edit scrim #${s.id}` }));
       }
 
       if (action === 'claim') {
@@ -2234,15 +2463,23 @@ async function handleHttp(req, res) {
 }
 
 // Tiny web server: uptime pingers hit "/", and /dashboard shows the dashboard when DASHBOARD_TOKEN is set
-http
-  .createServer((req, res) => {
-    handleHttp(req, res).catch((e) => {
-      console.error('Web request failed:', e.message);
-      if (!res.headersSent) res.writeHead(500);
-      res.end('Something went wrong');
-    });
-  })
-  .listen(process.env.PORT || 3000);
+const WEB_PORT = process.env.PORT || 3000;
+const webServer = http.createServer((req, res) => {
+  handleHttp(req, res).catch((e) => {
+    console.error('Web request failed:', e.message);
+    if (!res.headersSent) res.writeHead(500);
+    res.end('Something went wrong');
+  });
+});
+// A busy port must not crash the bot (that caused a restart loop that filled the disk with logs)
+webServer.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error(`WARNING: port ${WEB_PORT} is already in use, so the web page and dashboard are off. Another copy of the bot is probably running (check \`pm2 list\`). Two copies on one token reply twice to everything.`);
+  } else {
+    console.error('Web server error:', e.message);
+  }
+});
+webServer.listen(WEB_PORT);
 
 console.log('DISCORD_TOKEN set:', Boolean(TOKEN), '| length:', TOKEN ? TOKEN.length : 0);
 console.log('CLIENT_ID set:', Boolean(CLIENT_ID));
